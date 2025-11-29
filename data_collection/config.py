@@ -6,14 +6,20 @@ GAME_REGION = (0, 0, SCREEN_WIDTH, SCREEN_HEIGHT)
 
 # ROI definitions (left, top, width, height)
 ROIS = {
-    # Top-left: Camp health bar + target portrait
-    "camp_info": (5, 60, 230, 90),
+    "camp_info": (80, 68, 164, 84),
+    "timer": (1648, 64, 50, 32),
+    "minimap": (1336, 658, 370, 360),
+}
 
-    # Top-right: Game timer
-    "timer": (SCREEN_WIDTH - 100, 60, 90, 30),
-
-    # Bottom-right: Minimap
-    "minimap": (SCREEN_WIDTH - 370, SCREEN_HEIGHT - 450, 370, 360),
+# Minimap zones (relative to minimap ROI) - (x1, y1, x2, y2)
+MINIMAP_ZONES = {
+    "blue_buff": (82, 160, 126, 200),
+    "gromp": (52, 152, 92, 190),
+    "wolves": (86, 194, 120, 230),
+    "raptors": (158, 218, 192, 252),
+    "red_buff": (176, 250, 214, 282),
+    "krugs": (192, 274, 224, 310),
+    "spawn": (0, 250, 124, 364),
 }
 
 # Colors for ROI visualization (R, G, B, A)

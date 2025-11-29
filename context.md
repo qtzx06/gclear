@@ -17,3 +17,5 @@ added calibrate.py - drag rois to reposition, drag corners to resize, define min
 added TRAINING.md with full instructions for training on linux gpu - dataset download, yolo commands, class info, project context.
 
 created clean `context` branch with code only (no images/videos/datasets) for github push.
+
+trained model on roboflow, downloaded weights to models/hecarim.pt. inference working - blue/gromp 97-99%, player 85-97%, mm_player 78-91%.
