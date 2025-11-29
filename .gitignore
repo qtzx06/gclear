@@ -1,0 +1,36 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.venv/
+venv/
+.env
+
+# YOLO / ML
+runs/
+datasets/
+*.pt
+*.onnx
+*.engine
+
+# Data (large files)
+data/raw/*.mov
+data/raw/*.mp4
+*.mov
+*.mp4
+
+# Roboflow
+*.rf.*
+
+# macOS
+.DS_Store
+._*
+
+# IDE
+.vscode/
+.idea/
+
+# Secrets
+*api_key*
+*.secret
