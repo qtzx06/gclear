@@ -9,6 +9,7 @@ from typing import Optional
 from PIL import Image
 from io import BytesIO
 from dotenv import load_dotenv
+from som import get_som_prompt_section
 
 load_dotenv()
 
@@ -22,29 +23,85 @@ API_URL = "https://api.x.ai/v1/chat/completions"
 
 SCREEN_INFO = """
 SCREEN LAYOUT (1710x1107):
-- Game view: Center of screen, player character usually near center
-- Health bar ROI: (132, 72, 104, 36) - top left area shows targeted camp HP
-- Timer ROI: (1648, 64, 50, 32) - top right shows game time
-- Minimap: (1336, 658, 370, 360) - bottom right corner
+- Game view: Center of screen, Hecarim (armored centaur) is the player
+- Health bar ROI: top left shows targeted camp HP as "current/max"
+- Minimap: bottom right corner
 
-MINIMAP CLICK POSITIONS (for walking to camps):
+MINIMAP CLICK POSITIONS (for WALK action):
 - blue_buff: (1440, 838)
 - gromp: (1408, 829)
-- wolves: (1439, 870)
-- raptors: (1511, 893)
-- red_buff: (1531, 924)
-- krugs: (1544, 950)
+- wolves: (1435, 875)
+- raptors: (1511, 905)
+- red_buff: (1531, 938)
+- krugs: (1544, 965)
+"""
 
+CAMP_DESCRIPTIONS = """
+=== CAMP VISUAL DESCRIPTIONS ===
+YOLO detects these as class names. Here's what each looks like:
+
+"blue" = BLUE SENTINEL (Blue Buff):
+  - Stone golem with GLOWING BLUE ORB floating above its head
+  - Rocky gray body, humanoid shape
+  - Has 2300 max HP
+
+"gromp" = GROMP:
+  - Large brown FROG/TOAD creature
+  - Sits on a rock, has big eyes
+  - Bulky, wide body
+  - Has 2100 max HP
+
+"wolves" = WOLVES:
+  - Pack of gray/white wolves
+  - One large wolf + smaller wolves
+  - Has ~1800 max HP (big wolf)
+
+"raptors" = RAPTORS:
+  - Red/orange chicken-like birds
+  - One large raptor + small ones
+  - Has ~1200 max HP (big raptor)
+
+"red" = RED BRAMBLEBACK (Red Buff):
+  - Large creature with GLOWING RED stones on back
+  - Brown/red coloring, hunched posture
+  - Has 2300 max HP
+
+"krugs" = KRUGS:
+  - Rock creatures, stone golems
+  - One large + medium + small krugs
+  - Gray/brown rocks
+
+"player" = HECARIM (you):
+  - Armored centaur (horse body, human torso)
+  - Blue/teal glowing weapon
+  - This is YOU - don't attack this!
+
+"mm_player" = Player icon on minimap (small blue dot)
+"""
+
+ABILITIES_INFO = """
 ABILITIES:
-- Q: Main damage spell (use often during combat)
+- Q: Main damage spell - USE FREQUENTLY in combat
 - W: Heal/sustain
-- E: Speed boost charge
-- F: Smite (use on big camps when HP low, ~300-500)
+- F: Smite - USE when camp HP < 500 to secure kill
 
-ATTACK CONTROLS:
-- Right-click: Move to location / attack target
-- Left-click: SELECT target (shows health bar above it)
-- A + Left-click: Attack-move (auto-attacks nearest enemy)
+LEVEL UP (use "level_up" field):
+- Set "level_up": "Q" to level up Q ability (Ctrl+Q)
+- Level Q at game start (before 0:15)
+"""
+
+STARTUP_INFO = """
+=== STARTUP SEQUENCE (game time < 1:30) ===
+If game_time shows early game (< 0:15):
+1. LEVEL_UP Q first (set "level_up": "Q")
+2. SHOP action to buy Gustwalker Hatchling
+3. WALK to blue_buff position
+
+If game_time is between 0:15 and 1:30:
+- WALK to blue_buff and WAIT (camp spawns at 1:30)
+
+If game_time >= 1:30:
+- Blue buff has spawned, start clearing!
 """
 
 CLEAR_ORDER = ["blue_buff", "gromp", "wolves", "raptors", "red_buff", "krugs"]
@@ -54,10 +111,16 @@ CLEAR_ORDER = ["blue_buff", "gromp", "wolves", "raptors", "red_buff", "krugs"]
 # Helper functions
 # -----------------------------------------------------------------------------
 
-def encode_image_to_base64(img: Image.Image) -> str:
-    """Encode PIL image to base64 PNG."""
+def encode_image_to_base64(img: Image.Image, max_size: int = 800) -> str:
+    """Encode PIL image to base64 JPEG (smaller = faster upload)."""
+    # Resize if too large
+    w, h = img.size
+    if w > max_size or h > max_size:
+        ratio = min(max_size / w, max_size / h)
+        img = img.resize((int(w * ratio), int(h * ratio)), Image.Resampling.LANCZOS)
+
     buffer = BytesIO()
-    img.save(buffer, format="PNG", optimize=True)
+    img.save(buffer, format="JPEG", quality=70)  # JPEG is much smaller than PNG
     return base64.standard_b64encode(buffer.getvalue()).decode("utf-8")
 
 
@@ -93,56 +156,19 @@ def build_tactical_prompt(
     current_state: str,
     target_camp: str,
     current_zone: Optional[str],
-    planner_context: str
+    planner_context: str,
+    game_time: Optional[str] = None
 ) -> str:
-    """Build the tactical decision prompt."""
-    return f"""You control Hecarim jungle clear. You receive DATA from our systems - TRUST THIS DATA over screenshot analysis.
+    """Build advisory prompt - Grok analyzes, state machine acts."""
+    return f"""Hecarim jungle clear advisor. Analyze the screenshot.
 
-{SCREEN_INFO}
+Current: state={current_state}, target={target_camp}, zone={current_zone or "?"}, time={game_time or "?"}
+Detections: {detection_str}
+HP: {health_str}
 
-=== SYSTEM DATA (TRUST THIS) ===
-DETECTIONS (from CV model): {detection_str}
-HEALTH BAR (from OCR): {health_str}
-PLAYER ZONE: {current_zone or "unknown"}
-TARGET CAMP: {target_camp}
-BOT STATE: {current_state}
+Brief analysis (1-2 sentences): What's happening? Any issues?
 
-STRATEGIC CONTEXT: {planner_context or "Start blue buff clear"}
-
-CLEAR ORDER: blue_buff -> gromp -> wolves -> raptors -> red_buff -> krugs
-
-=== DECISION LOGIC ===
-Use the SYSTEM DATA above to decide:
-
-1. If HEALTH BAR says "VISIBLE: X/Y = Z%" -> Camp is targeted, you can ATTACK
-2. If HEALTH BAR says "NONE" but DETECTIONS show camp -> Use SELECT to target it
-3. If DETECTIONS show no camp AND HEALTH is NONE -> Camp dead, use FINISH
-4. If HEALTH shows < 40% -> Consider KITE toward next camp
-5. If HEALTH shows < 500 HP -> Use SMITE
-6. If camp not in DETECTIONS -> Use WALK to minimap position
-
-=== ACTIONS ===
-- ATTACK: Right-click + A-click camp. Use when health VISIBLE.
-- SELECT: Left-click camp to target it. Use when health NONE but camp detected.
-- KITE: Move toward next camp while attacking. Use when HP < 40%.
-- WALK: Click minimap to walk to camp. Use when camp not detected.
-- SMITE: Press F. Use when HP ~300-500.
-- FINISH: Camp dead, advance to next. Use when no camp AND no health.
-- WAIT: Do nothing this frame.
-
-=== ABILITIES ===
-- "Q": Main damage - USE EVERY ATTACK FRAME
-- "W": Heal
-- "F": Smite (finisher)
-
-RESPOND JSON ONLY:
-{{
-  "action": "ATTACK" | "SELECT" | "KITE" | "WALK" | "SMITE" | "FINISH" | "WAIT",
-  "target": "{target_camp}",
-  "click": {{"x": <int>, "y": <int>}} or null,
-  "ability": "Q" | "W" | "F" | null,
-  "reasoning": "<brief>"
-}}"""
+JSON: {{"analysis":"<brief>","issue":"<problem or null>","tip":"<advice or null>"}}"""
 
 
 def build_planner_prompt(
@@ -181,7 +207,7 @@ class JungleStrategist:
     """Uses Grok vision to decide jungle clearing actions with full control."""
 
     def __init__(self):
-        self.client = httpx.Client(timeout=20.0)
+        # Note: Don't use persistent httpx.Client - not thread-safe
         self.headers = {
             "Content-Type": "application/json",
             "Authorization": f"Bearer {API_KEY}"
@@ -191,7 +217,7 @@ class JungleStrategist:
         self.decision_count = 0
 
     def _call_grok(self, img: Image.Image, prompt: str, reasoning: bool = False) -> Optional[str]:
-        """Call Grok vision API."""
+        """Call Grok vision API (thread-safe)."""
         image_data = encode_image_to_base64(img)
         model = "grok-4-1-fast-reasoning" if reasoning else "grok-4-1-fast-non-reasoning"
 
@@ -204,7 +230,7 @@ class JungleStrategist:
                         {
                             "type": "image_url",
                             "image_url": {
-                                "url": f"data:image/png;base64,{image_data}"
+                                "url": f"data:image/jpeg;base64,{image_data}"
                             }
                         },
                         {
@@ -219,7 +245,8 @@ class JungleStrategist:
         }
 
         try:
-            response = self.client.post(API_URL, json=payload, headers=self.headers)
+            # Use httpx.post directly (thread-safe, creates new connection)
+            response = httpx.post(API_URL, json=payload, headers=self.headers, timeout=30.0)
             response.raise_for_status()
             result = response.json()
             return result["choices"][0]["message"]["content"]
@@ -234,9 +261,10 @@ class JungleStrategist:
         current_state: str,
         target_camp: str,
         detections: list,
-        current_zone: Optional[str]
+        current_zone: Optional[str],
+        game_time: Optional[str] = None
     ) -> dict:
-        """Get tactical decision from Grok (fast, every 2 frames)."""
+        """Get tactical decision from Grok (every frame)."""
         detection_str = format_detections(detections)
         health_str = format_health(ocr_health)
 
@@ -246,7 +274,8 @@ class JungleStrategist:
             current_state=current_state,
             target_camp=target_camp,
             current_zone=current_zone,
-            planner_context=self.planner_context
+            planner_context=self.planner_context,
+            game_time=game_time
         )
 
         response = self._call_grok(img, prompt, reasoning=False)
@@ -308,4 +337,4 @@ class JungleStrategist:
 
     def close(self):
         """Clean up."""
-        self.client.close()
+        pass  # No persistent client to close

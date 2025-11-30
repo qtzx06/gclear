@@ -9,6 +9,8 @@ import re
 import os
 import math
 import random
+import threading
+from queue import Queue, Empty
 from datetime import datetime
 from enum import Enum, auto
 from dataclasses import dataclass
@@ -27,25 +29,34 @@ from data_collection.config import (
     SCREEN_WIDTH, SCREEN_HEIGHT, ROIS, MINIMAP_ZONES
 )
 from strategist import JungleStrategist
-from overlay import init_overlay, log_overlay, process_events
+from overlay import init_overlay, log_overlay, log_strategist, strategist_thinking, process_events
+from som import draw_som_overlay, get_region
 
 DEBUG_VIEW = False  # Show detection window (blocks control)
 DEBUG_RECORD = True  # Save debug frames
 RUNS_DIR = "runs"
 
 # Strategist config
-USE_STRATEGIST = True  # Enable Grok strategist
-STRATEGIST_INTERVAL = 1  # Call strategist every frame - Grok is the controller
-PLANNER_INTERVAL = 10  # Call deep reasoning planner every N frames
+USE_STRATEGIST = False  # Disabled - focus on state machine first
+GROK_QUEUE_SIZE = 2  # Max pending frames for Grok (drop old if full)
+PLANNER_INTERVAL = 50  # Call deep reasoning planner every N frames
 
 
 class State(Enum):
-    IDLE = auto()
-    WALK_TO_CAMP = auto()
-    APPROACH_CAMP = auto()  # Right-click to get in range
-    ATTACK_CAMP = auto()
-    KITING = auto()         # Kite while clearing (< 50% HP)
-    WAIT_RESPAWN = auto()
+    # Early game states
+    STARTUP_LEVELUP = auto()    # Level up Q at game start
+    STARTUP_BUY = auto()        # Buy starter item
+    WALKING_TO_CAMP = auto()    # Walking via minimap
+    WAITING_FOR_SPAWN = auto()  # At camp, waiting for 1:30
+
+    # Combat states
+    ENGAGING = auto()           # Moving to attack camp
+    ATTACKING = auto()          # In combat, spamming abilities
+    KITING = auto()             # Low HP, kiting toward next camp
+
+    # Transition states
+    CAMP_CLEARED = auto()       # Camp dead, transitioning
+    IDLE = auto()               # Nothing to do
 
 
 @dataclass
@@ -92,6 +103,23 @@ LEVEL_UP_ORDER = {
 # Q cooldown (spam it every second)
 Q_COOLDOWN = 1.0
 
+# Game timing constants
+CAMP_SPAWN_TIME = 90  # 1:30 in seconds
+EARLY_GAME_END = 15   # First 15 seconds for buying
+
+
+def parse_game_time(time_str: str) -> int:
+    """Parse game time string 'M:SS' to seconds."""
+    if not time_str:
+        return 0
+    try:
+        parts = time_str.split(':')
+        if len(parts) == 2:
+            return int(parts[0]) * 60 + int(parts[1])
+    except:
+        pass
+    return 0
+
 # Kiting config
 KITE_THRESHOLD = 50.0  # Start kiting below this HP %
 ATTACK_MOVE_INTERVAL = 0.3  # Seconds between A-clicks while kiting
@@ -116,9 +144,19 @@ class JungleBot:
         self.expected_max_hp = None  # Track expected max HP for current camp
         self.initial_engage_done = False  # Track if initial attack_click done
 
-        # Strategist
+        # Early game tracking
+        self.leveled_up_q = False
+        self.bought_item = False
+
+        # Strategist (threaded)
         self.strategist = JungleStrategist() if USE_STRATEGIST else None
         self.last_grok_decision = None
+        self.last_grok_message = None  # For main thread to display
+        self.grok_decision_lock = threading.Lock()
+        self.grok_queue = Queue(maxsize=GROK_QUEUE_SIZE)
+        self.grok_thread = None
+        self.grok_running = False
+        self.planner_counter = 0
 
         # Set up run directory with timestamp
         self.run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -197,6 +235,132 @@ class JungleBot:
         center_y = mm_y + (y1 + y2) // 2
         return (center_x, center_y)
 
+    def compute_state(
+        self,
+        game_time_str: str,
+        current_zone: str,
+        target_camp: str,
+        camp_detection: Optional[Detection],
+        camp_health: Optional[dict]
+    ) -> State:
+        """Determine current state based on game conditions (hardcoded logic)."""
+        game_time = parse_game_time(game_time_str)
+
+        # --- EARLY GAME (before camps spawn) ---
+        if game_time < EARLY_GAME_END:
+            # Level up Q first
+            if not self.leveled_up_q:
+                return State.STARTUP_LEVELUP
+            # Then buy item
+            if not self.bought_item:
+                return State.STARTUP_BUY
+
+        # --- PRE-SPAWN (walking to camp, waiting) ---
+        if game_time < CAMP_SPAWN_TIME:
+            # Are we at the target camp zone?
+            if current_zone == target_camp:
+                return State.WAITING_FOR_SPAWN
+            else:
+                return State.WALKING_TO_CAMP
+
+        # --- CAMPS HAVE SPAWNED ---
+        # Is target camp visible on screen?
+        if camp_detection:
+            # Do we have it targeted (health bar showing)?
+            if camp_health:
+                hp_pct = camp_health.get('percent', 100)
+                if hp_pct < KITE_THRESHOLD and self.get_next_camp_zone():
+                    return State.KITING
+                return State.ATTACKING
+            else:
+                # Camp visible but not targeted - engage it
+                return State.ENGAGING
+        else:
+            # Camp not visible
+            if current_zone == target_camp:
+                # We're at the zone but camp not detected - it's dead
+                return State.CAMP_CLEARED
+            else:
+                # Need to walk there
+                return State.WALKING_TO_CAMP
+
+        return State.IDLE
+
+    def execute_state(
+        self,
+        state: State,
+        camp_detection: Optional[Detection],
+        camp_health: Optional[dict],
+        mm_pos: Optional[tuple],
+        detections: list
+    ):
+        """Execute actions based on current state (hardcoded behavior)."""
+
+        if state == State.STARTUP_LEVELUP:
+            # Level up Q
+            self.level_up_ability("Q")
+            self.leveled_up_q = True
+            log_overlay("Leveled up Q")
+
+        elif state == State.STARTUP_BUY:
+            # Buy starter item
+            self._buy_starter_item()
+            self.bought_item = True
+            log_overlay("Bought starter item")
+
+        elif state == State.WALKING_TO_CAMP:
+            # Click minimap to walk to target camp
+            if self.can_act():
+                region = get_region(f"mm_{self.target_camp.replace('_buff', '')}")
+                if region:
+                    self.click(region.x, region.y, right=True)
+                    log_overlay(f"Walking to {self.target_camp}")
+
+        elif state == State.WAITING_FOR_SPAWN:
+            # Just wait, maybe position near camp
+            pass  # Do nothing, camps not spawned yet
+
+        elif state == State.ENGAGING:
+            # Camp visible, need to click it to target
+            if camp_detection and self.can_act():
+                self.click(camp_detection.x, camp_detection.y, right=False)  # Left click to target
+                self.camp_selected = True
+                log_overlay(f"Targeting {self.target_camp}")
+
+        elif state == State.ATTACKING:
+            # In combat - spam attacks and abilities
+            if camp_detection:
+                if not self.initial_engage_done:
+                    # Initial attack
+                    use_spam = self.target_camp in SPAM_CLICK_CAMPS
+                    self.attack_click(camp_detection.x, camp_detection.y, spam=use_spam)
+                    self.initial_engage_done = True
+                    self.in_combat = True
+                else:
+                    # Continue attacking with A-clicks
+                    self.attack_move_click(camp_detection.x, camp_detection.y)
+
+                # Use Q on cooldown
+                self.use_q_if_ready()
+
+                # Check for smite
+                if camp_health and camp_health.get('current', 9999) < 500:
+                    self.press_key("f")
+                    log_overlay("SMITE!")
+
+        elif state == State.KITING:
+            # Low HP, kite toward next camp
+            next_camp = self.get_next_camp_zone()
+            if next_camp and mm_pos:
+                kite_x, kite_y = self.get_kite_direction(mm_pos, next_camp)
+                self.kite_move(kite_x, kite_y)
+                self.use_q_if_ready()
+
+        elif state == State.CAMP_CLEARED:
+            # Camp is dead, advance to next
+            self._finish_camp()
+            log_overlay(f"Cleared! Next: {self.target_camp}")
+
     def find_camp_on_screen(self, detections: list[Detection], camp_name: str) -> Optional[Detection]:
         """Find a specific camp in detections. Returns the largest one (for multi-monster camps)."""
         target_cls = CAMP_CLASSES.get(camp_name)
@@ -272,15 +436,18 @@ class JungleBot:
                             current, max_hp = int(first), int(second)
 
             if current is not None and max_hp is not None and max_hp > 0:
-                # Validate the reading
-                if not self._validate_hp_reading(current, max_hp):
+                # Simplified validation - just sanity checks
+                if current > max_hp:
+                    return None
+                if max_hp < 200 or max_hp > 10000:
                     return None
 
                 percent = round((current / max_hp) * 100, 1)
                 return {"current": current, "max": max_hp, "percent": percent, "text": f"{current}/{max_hp}"}
 
             return None
-        except Exception:
+        except Exception as e:
+            print(f"OCR error: {e}")
             return None
 
     def _validate_hp_reading(self, current: int, max_hp: int) -> bool:
@@ -513,9 +680,23 @@ class JungleBot:
             self.camp_index = 0
             print(f"Defaulting to: {self.target_camp}")
 
-        # Get click position from Grok or default
+        # Get click position - prefer click_id (SoM) over raw coordinates
+        click_id = decision.get("click_id")
         click_pos = decision.get("click")
         ability = decision.get("ability")
+        level_up = decision.get("level_up")
+
+        # Resolve click_id to coordinates (string IDs like "A_N", "mm_blue")
+        if click_id:
+            region = get_region(str(click_id))
+            if region:
+                click_pos = {"x": region.x, "y": region.y}
+                print(f"  -> SoM {click_id} @ ({region.x}, {region.y})")
+
+        # Level up ability if specified (Ctrl+key)
+        if level_up and level_up in ["Q", "W", "E", "R"]:
+            self.level_up_ability(level_up)
+            print(f"  -> LEVEL UP {level_up}")
 
         # Use ability if specified
         if ability:
@@ -598,9 +779,33 @@ class JungleBot:
             # Current camp is dead - move to next
             self._finish_camp()
 
+        elif action == "SHOP":
+            # Open shop, buy Gustwalker Hatchling, close shop
+            self._buy_starter_item()
+
         elif action == "WAIT":
             # Do nothing - Grok decided to wait
             pass
+
+    def _buy_starter_item(self):
+        """Open shop, buy Gustwalker Hatchling, close shop."""
+        try:
+            # Press B to open shop
+            self.press_key("b")
+            time.sleep(0.3)
+
+            # Gustwalker Hatchling in recommended items - right-click to buy
+            # Position may need calibration based on your shop layout
+            gustwalker_pos = (680, 340)
+            subprocess.run(["/opt/homebrew/bin/cliclick", f"rc:{gustwalker_pos[0]},{gustwalker_pos[1]}"], check=True)
+            time.sleep(0.2)
+
+            # Press B to close shop
+            self.press_key("b")
+            print("  -> Bought Gustwalker Hatchling")
+        except Exception as e:
+            print(f"  -> Shop error: {e}")
+            self.press_key("b")  # Try to close shop anyway
 
     def _finish_camp(self):
         """Called when a camp is cleared - level up and move to next."""
@@ -623,10 +828,106 @@ class JungleBot:
             self.state = State.IDLE
             print("Clear complete!")
 
+    def _grok_worker(self):
+        """Background thread for Grok API calls."""
+        print("[GROK THREAD] Started")
+        while self.grok_running:
+            try:
+                # Wait for frame data (with timeout so we can check grok_running)
+                frame_data = self.grok_queue.get(timeout=0.5)
+            except Empty:
+                continue
+
+            if frame_data is None:  # Shutdown signal
+                break
+
+            try:
+                # Unpack frame data
+                som_img = frame_data["som_img"]
+                camp_health = frame_data["camp_health"]
+                state_name = frame_data["state_name"]
+                target_camp = frame_data["target_camp"]
+                detections = frame_data["detections"]
+                current_zone = frame_data["current_zone"]
+                game_time = frame_data["game_time"]
+                is_planner = frame_data.get("is_planner", False)
+
+                if is_planner:
+                    # Deep planner call
+                    plan = self.strategist.plan(
+                        img=som_img,
+                        recent_logs=self.logs[-10:],
+                        current_state=state_name,
+                        target_camp=target_camp
+                    )
+                    plan_short = plan[:80] + "..." if len(plan) > 80 else plan
+                    print(f"[GROK THREAD] PLANNER: {plan_short}")
+                    # Store for main thread to display (Qt must update from main thread)
+                    with self.grok_decision_lock:
+                        self.last_grok_message = f"[PLAN] {plan_short}"
+                else:
+                    # Advisory analysis (Grok observes, doesn't control)
+                    raw_response = self.strategist.decide(
+                        img=som_img,
+                        ocr_health=camp_health,
+                        current_state=state_name,
+                        target_camp=target_camp,
+                        detections=detections,
+                        current_zone=current_zone,
+                        game_time=game_time
+                    )
+
+                    if raw_response:
+                        analysis = raw_response.get('analysis', '')
+                        issue = raw_response.get('issue')
+                        tip = raw_response.get('tip')
+
+                        # Build display message
+                        lines = [f"[ANALYSIS] {analysis}"]
+                        if issue:
+                            lines.append(f"[ISSUE] {issue}")
+                        if tip:
+                            lines.append(f"[TIP] {tip}")
+
+                        grok_msg = "\n".join(lines)
+                        print(f"[GROK] {analysis}")
+
+                        with self.grok_decision_lock:
+                            self.last_grok_message = grok_msg
+
+            except Exception as e:
+                print(f"[GROK THREAD] Error: {e}")
+                import traceback
+                traceback.print_exc()
+
+        print("[GROK THREAD] Stopped")
+
+    def _start_grok_thread(self):
+        """Start the Grok worker thread."""
+        if self.strategist and not self.grok_running:
+            self.grok_running = True
+            self.grok_thread = threading.Thread(target=self._grok_worker, daemon=True)
+            self.grok_thread.start()
+
+    def _stop_grok_thread(self):
+        """Stop the Grok worker thread."""
+        if self.grok_running:
+            self.grok_running = False
+            # Send shutdown signal
+            try:
+                self.grok_queue.put(None, timeout=0.1)
+            except:
+                pass
+            if self.grok_thread:
+                self.grok_thread.join(timeout=2.0)
+
     def show_debug(self, img: Image.Image, detections: list[Detection], mm_pos, current_zone, game_time=None, camp_health=None):
-        """Show debug window with detections."""
+        """Show debug window with detections and SoM overlay."""
+        # Add SoM overlay to the image (includes detection coords)
+        img_with_som = draw_som_overlay(img, detections)
+
         # Convert to cv2 format
-        frame = cv2.cvtColor(np.array(img), cv2.COLOR_RGB2BGR)
+        frame = cv2.cvtColor(np.array(img_with_som), cv2.COLOR_RGB2BGR)
 
         # Draw ROIs
         for name, (x, y, w, h) in ROIS.items():
@@ -673,70 +974,89 @@ class JungleBot:
             cv2.waitKey(1)
 
     def update(self):
-        """Main update loop - gather data and let Grok decide."""
+        """Main update loop - state machine driven, Grok for advisory."""
         img = self.capture_screen()
         detections = self.detect(img)
 
-        # --- DATA GATHERING (state machine provides context) ---
+        # --- FAST DATA GATHERING (every frame) ---
         mm_pos = self.get_minimap_player_pos(detections)
         current_zone = self.get_player_zone(mm_pos) if mm_pos else None
         game_time = self.ocr_timer(img)
         camp_health = self.ocr_camp_health(img)
 
-        # Find target camp on screen
-        target_camp_detection = None
-        if self.target_camp:
-            target_camp_detection = self.find_camp_on_screen(detections, self.target_camp)
-
-        # Build context data for Grok
-        context = {
-            "zone": current_zone,
-            "target_camp": self.target_camp or CLEAR_ORDER[0],
-            "camp_index": self.camp_index,
-            "camp_visible": target_camp_detection is not None,
-            "camp_position": (target_camp_detection.x, target_camp_detection.y) if target_camp_detection else None,
-            "health": camp_health,
-            "in_combat": self.in_combat,
-            "mm_pos": mm_pos,
-            "game_time": game_time,
-        }
-
         # Initialize target if not set
         if not self.target_camp:
             self.target_camp = CLEAR_ORDER[0]
 
-        # --- PLANNER (strategic direction every N frames) ---
-        if self.strategist and self.frame_count % PLANNER_INTERVAL == 0 and self.frame_count > 0:
-            plan = self.strategist.plan(
-                img=img,
-                recent_logs=self.logs[-10:],
-                current_state=self.state.name,
-                target_camp=self.target_camp
-            )
-            plan_short = plan[:80] + "..." if len(plan) > 80 else plan
-            print(f"PLANNER: {plan_short}")
-            log_overlay(f"PLAN: {plan_short}")
+        # Find target camp on screen
+        target_camp_detection = self.find_camp_on_screen(detections, self.target_camp)
 
-        # --- GROK DECISION (every frame - Grok is the controller) ---
-        grok_decision = None
+        # --- COMPUTE STATE (hardcoded logic) ---
+        new_state = self.compute_state(
+            game_time_str=game_time,
+            current_zone=current_zone,
+            target_camp=self.target_camp,
+            camp_detection=target_camp_detection,
+            camp_health=camp_health
+        )
+
+        # Log state changes
+        if new_state != self.state:
+            self.state = new_state
+            log_overlay(f"STATE: {self.state.name}")
+
+        # --- EXECUTE STATE ACTIONS ---
+        self.execute_state(
+            state=self.state,
+            camp_detection=target_camp_detection,
+            camp_health=camp_health,
+            mm_pos=mm_pos,
+            detections=detections
+        )
+
+        # --- QUEUE FRAME FOR GROK (advisory/logging only) ---
         if self.strategist:
-            grok_decision = self.strategist.decide(
-                img=img,
-                ocr_health=camp_health,
-                current_state=self.state.name,
-                target_camp=self.target_camp,
-                detections=detections,
-                current_zone=current_zone
-            )
-            self.last_grok_decision = grok_decision
-            grok_msg = f"GROK: {grok_decision['action']} -> {grok_decision.get('target')} | {grok_decision.get('reasoning', '')[:40]}"
-            print(grok_msg)
-            log_overlay(grok_msg)
+            self.planner_counter += 1
+            is_planner = (self.planner_counter % PLANNER_INTERVAL == 0) and self.planner_counter > 0
+
+            # Only queue occasionally to reduce load
+            if self.frame_count % 5 == 0 or is_planner:
+                som_img = draw_som_overlay(img, detections)
+                frame_data = {
+                    "som_img": som_img,
+                    "camp_health": camp_health,
+                    "state_name": self.state.name,
+                    "target_camp": self.target_camp,
+                    "detections": detections,
+                    "current_zone": current_zone,
+                    "game_time": game_time,
+                    "is_planner": is_planner,
+                }
+
+                if self.grok_queue.full():
+                    try:
+                        self.grok_queue.get_nowait()
+                    except Empty:
+                        pass
+                try:
+                    self.grok_queue.put_nowait(frame_data)
+                except:
+                    pass
 
         # --- DEBUG/LOGGING ---
         if DEBUG_VIEW or DEBUG_RECORD:
             self.show_debug(img, detections, mm_pos, current_zone, game_time, camp_health)
 
+        # Get Grok message for display (advisory only)
+        with self.grok_decision_lock:
+            grok_message = self.last_grok_message
+            self.last_grok_message = None
+
+        if grok_message:
+            for line in grok_message.split('\n'):
+                log_strategist(line)
+
+        # --- LOGGING ---
         log_entry = {
             "frame": self.frame_count,
             "timestamp": time.time(),
@@ -745,29 +1065,29 @@ class JungleBot:
             "target": self.target_camp,
             "game_time": game_time,
             "camp_health": camp_health,
-            "grok_decision": grok_decision,
-            "context": context,
             "detections": [{"cls": d.cls, "conf": d.conf, "x": d.x, "y": d.y} for d in detections],
             "mm_pos": mm_pos,
         }
         self.logs.append(log_entry)
 
-        hp_str = f"{camp_health['text']} ({camp_health['percent']}%)" if camp_health else "N/A"
-        status_msg = f"[{self.frame_count}] Zone:{current_zone} | Target:{self.target_camp} | HP:{hp_str}"
+        # Status line: [time] STATE | target | HP | detections
+        hp_str = f"{camp_health['current']}/{camp_health['max']}" if camp_health else "-"
+        det_summary = ",".join([d.cls for d in detections[:4]])
+        time_str = game_time or "0:00"
+        zone_str = current_zone or "?"
+
+        status_msg = f"[{time_str}] {self.state.name} | {self.target_camp} @ {zone_str} | HP:{hp_str}"
         print(status_msg)
         log_overlay(status_msg)
 
-        # --- EXECUTE GROK'S DECISION (Grok is the sole decision maker) ---
-        if grok_decision:
-            self._apply_grok_decision(grok_decision, detections, mm_pos)
-
         self.frame_count += 1
 
-    def run(self, tick_rate: float = 0.5):
+    def run(self, tick_rate: float = 0.2):
         """Run the bot loop."""
         print("Starting jungle bot... (Ctrl+C to stop)")
         print(f"Clear order: {CLEAR_ORDER}")
         print(f"Run ID: {self.run_id}")
+        print(f"Tick rate: {tick_rate}s ({1/tick_rate:.1f} FPS target)")
         if DEBUG_RECORD:
             print(f"Saving to: {self.run_dir}/")
 
@@ -775,6 +1095,10 @@ class JungleBot:
         self.overlay = init_overlay()
         log_overlay("GClear Bot Started")
         log_overlay(f"Clear: {' -> '.join(CLEAR_ORDER)}")
+
+        # Start Grok thread
+        self._start_grok_thread()
+        log_overlay("Grok thread started")
 
         try:
             while True:
@@ -785,6 +1109,7 @@ class JungleBot:
             print("\nStopped.")
             log_overlay("Bot Stopped")
         finally:
+            self._stop_grok_thread()
             if self.strategist:
                 self.strategist.close()
             self.save_logs()

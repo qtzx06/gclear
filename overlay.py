@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Always-on-top terminal overlay for bot status."""
+"""Always-on-top terminal overlays for bot status and strategist."""
 
 import sys
-from PyQt6.QtWidgets import QApplication, QWidget, QVBoxLayout, QTextEdit
+from PyQt6.QtWidgets import QApplication, QWidget, QVBoxLayout, QTextEdit, QLabel
 from PyQt6.QtCore import Qt, QTimer
 from PyQt6.QtGui import QFont, QColor, QPalette
 from collections import deque
@@ -11,10 +11,13 @@ from collections import deque
 class OverlayWindow(QWidget):
     """Small always-on-top terminal overlay."""
 
-    def __init__(self, max_lines: int = 15):
+    def __init__(self, max_lines: int = 15, x: int = 10, y: int = 800, title: str = ""):
         super().__init__()
         self.max_lines = max_lines
         self.lines = deque(maxlen=max_lines)
+        self.pos_x = x
+        self.pos_y = y
+        self.title = title
         self.setup_ui()
 
     def setup_ui(self):
@@ -23,7 +26,7 @@ class OverlayWindow(QWidget):
             Qt.WindowType.WindowStaysOnTopHint |
             Qt.WindowType.FramelessWindowHint |
             Qt.WindowType.Tool |
-            Qt.WindowType.X11BypassWindowManagerHint  # Helps with focus issues
+            Qt.WindowType.X11BypassWindowManagerHint
         )
 
         # Make window semi-transparent and not take focus
@@ -31,12 +34,20 @@ class OverlayWindow(QWidget):
         self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating)
         self.setAttribute(Qt.WidgetAttribute.WA_MacAlwaysShowToolWindow)
 
-        # Size and position (bottom left)
-        self.setGeometry(10, 800, 500, 280)  # x, y, width, height
+        # Size and position
+        self.setGeometry(self.pos_x, self.pos_y, 400, 250)
 
         # Layout
         layout = QVBoxLayout(self)
         layout.setContentsMargins(5, 5, 5, 5)
+        layout.setSpacing(2)
+
+        # Title label
+        if self.title:
+            self.title_label = QLabel(self.title)
+            self.title_label.setFont(QFont("Monaco", 9))
+            self.title_label.setStyleSheet("color: #888888; padding: 2px;")
+            layout.addWidget(self.title_label)
 
         # Text display
         self.text_edit = QTextEdit()
@@ -72,25 +83,44 @@ class OverlayWindow(QWidget):
         self.text_edit.clear()
 
 
-# Global overlay instance
-_overlay = None
+# Global overlay instances
+_status_overlay = None
+_strategist_overlay = None
 _app = None
 
 
 def init_overlay():
-    """Initialize the overlay (call from main thread before bot starts)."""
-    global _overlay, _app
-    if _overlay is None:
+    """Initialize both overlays (call from main thread before bot starts)."""
+    global _status_overlay, _strategist_overlay, _app
+    if _status_overlay is None:
         _app = QApplication.instance() or QApplication(sys.argv)
-        _overlay = OverlayWindow()
-    return _overlay
+        # Status overlay on the left
+        _status_overlay = OverlayWindow(max_lines=12, x=10, y=800, title="BOT STATUS")
+        # Strategist overlay on the right
+        _strategist_overlay = OverlayWindow(max_lines=12, x=420, y=800, title="GROK STRATEGIST")
+        _strategist_overlay.log("waiting for first frame...")
+    return _status_overlay
 
 
 def log_overlay(message: str):
-    """Log a message to the overlay."""
-    global _overlay
-    if _overlay:
-        _overlay.log(message)
+    """Log a message to the status overlay."""
+    global _status_overlay
+    if _status_overlay:
+        _status_overlay.log(message)
+
+
+def log_strategist(message: str):
+    """Log a message to the strategist overlay."""
+    global _strategist_overlay
+    if _strategist_overlay:
+        _strategist_overlay.log(message)
+
+
+def strategist_thinking():
+    """Show thinking status in strategist overlay."""
+    global _strategist_overlay
+    if _strategist_overlay:
+        _strategist_overlay.log("thinking...")
 
 
 def process_events():
@@ -101,18 +131,22 @@ def process_events():
 
 
 if __name__ == "__main__":
-    # Test the overlay
+    # Test both overlays
     app = QApplication(sys.argv)
-    overlay = OverlayWindow()
+    status = OverlayWindow(max_lines=12, x=10, y=800, title="BOT STATUS")
+    strategist = OverlayWindow(max_lines=12, x=420, y=800, title="GROK STRATEGIST")
 
-    # Simulate log messages
-    import time
     timer = QTimer()
     counter = [0]
 
     def add_log():
         counter[0] += 1
-        overlay.log(f"[{counter[0]}] GROK: ATTACK -> blue_buff | Camp visible, engaging")
+        status.log(f"[{counter[0]}] Zone:blue_buff | Target:blue_buff | HP:1800/2300")
+        if counter[0] % 2 == 0:
+            strategist.log("thinking...")
+        else:
+            strategist.log(f"> ATTACK @(820,515) Q")
+            strategist.log("  Blue buff visible, attacking")
         if counter[0] >= 20:
             timer.stop()
 
