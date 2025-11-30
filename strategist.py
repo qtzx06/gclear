@@ -37,6 +37,31 @@ CAMP_MAX_HP = {
     "krugs": 1400,
 }
 
+# Minimum game time (seconds) before camp can possibly be cleared
+# blue spawns at 1:30, each camp takes ~8-10s to clear
+MIN_GAME_TIME_FOR_CLEAR = {
+    "blue_buff": 90 + 8,     # 1:38 earliest (spawn 1:30 + ~8s clear)
+    "gromp": 90 + 14,        # 1:44 (after blue)
+    "wolves": 90 + 20,       # 1:50 (after gromp)
+    "raptors": 90 + 28,      # 1:58 (after wolves + walk)
+    "red_buff": 90 + 36,     # 2:06 (after raptors)
+    "krugs": 90 + 46,        # 2:16 (after red)
+}
+
+
+def parse_game_time(game_time: str) -> Optional[int]:
+    """Parse game time string (e.g. '1:30' or '2:05') to seconds."""
+    if not game_time or game_time == "?":
+        return None
+    try:
+        parts = game_time.split(":")
+        if len(parts) == 2:
+            mins, secs = int(parts[0]), int(parts[1])
+            return mins * 60 + secs
+    except:
+        pass
+    return None
+
 
 # -----------------------------------------------------------------------------
 # Helper functions
@@ -65,15 +90,37 @@ def extract_json_from_response(response: str) -> Optional[dict]:
     return None
 
 
+def extract_verdict_from_response(response: str) -> dict:
+    """Extract VERDICT from response text."""
+    response_upper = response.upper()
+
+    # Look for VERDICT: DEAD or VERDICT: ALIVE
+    if "VERDICT: DEAD" in response_upper or "VERDICT:DEAD" in response_upper:
+        return {"camp_dead": True, "confidence": 0.9, "reason": "Grok verdict: DEAD"}
+    elif "VERDICT: ALIVE" in response_upper or "VERDICT:ALIVE" in response_upper:
+        return {"camp_dead": False, "confidence": 0.9, "reason": "Grok verdict: ALIVE"}
+    elif "VERDICT: WAITING" in response_upper or "VERDICT:WAITING" in response_upper:
+        return {"camp_dead": False, "confidence": 1.0, "reason": "Waiting for spawn"}
+
+    # Fallback - look for keywords
+    if "camp is dead" in response.lower() or "camp is cleared" in response.lower():
+        return {"camp_dead": True, "confidence": 0.7, "reason": "Inferred dead from text"}
+
+    return None
+
+
 def build_camp_verify_prompt(
     target_camp: str,
     time_at_camp: float,
     last_hp_percent: Optional[float],
     detections: list,
     current_zone: Optional[str],
-    game_time: Optional[str]
+    game_time: Optional[str],
+    zone_probs: dict = None,
+    map_side: str = "unknown",
+    is_early_game: bool = False
 ) -> str:
-    """Build prompt for camp clear verification - ONLY decides if camp is dead."""
+    """Build prompt for camp clear verification with detailed analysis."""
 
     min_time = MIN_KILL_TIME.get(target_camp, 6)
     max_hp = CAMP_MAX_HP.get(target_camp, 2000)
@@ -82,29 +129,48 @@ def build_camp_verify_prompt(
 
     det_str = ", ".join([f"{d.cls}" for d in detections]) if detections else "NONE"
 
-    return f"""You are a jungle clear verifier. Your ONLY job: decide if {target_camp} is DEAD and should move to {next_camp}.
+    # Format zone probabilities
+    if zone_probs:
+        top_3 = sorted(zone_probs.items(), key=lambda x: -x[1])[:3]
+        prob_str = ", ".join([f"{c}:{p:.0f}%" for c, p in top_3])
+    else:
+        prob_str = "unknown"
 
-DATA:
-- Target camp: {target_camp} (max HP: {max_hp})
-- Time fighting this camp: {time_at_camp:.1f} seconds
-- Minimum expected kill time: {min_time} seconds
-- Last known HP: {last_hp_percent:.0f}% (if available)
-- Current detections on screen: {det_str}
-- Player zone (minimap): {current_zone or "unknown"}
-- Game time: {game_time or "unknown"}
+    # Early game: camps haven't spawned yet
+    if is_early_game:
+        return f"""You're coaching a Hecarim jungle clear. Game time: {game_time} - camps spawn at 1:30.
 
-CLEAR ORDER: blue_buff -> gromp -> wolves -> raptors -> red_buff -> krugs
+What do you see? Where's the player heading? Quick thoughts on positioning while we wait.
 
-RULES:
-1. If time_at_camp < min_kill_time, camp is probably NOT dead (detection error)
-2. If HP was recently high (>30%), camp is probably NOT dead
-3. If target camp class is still detected on screen, camp is NOT dead
-4. Only say camp_dead=true if you're CONFIDENT it's actually dead
+End with: VERDICT: WAITING"""
 
-Look at the screenshot. Is {target_camp} actually dead?
+    # Camp descriptions for context
+    camp_desc = {
+        "blue_buff": "Blue Sentinel - a large blue golem monster with a glowing blue aura",
+        "gromp": "Gromp - a giant green/brown toad creature",
+        "wolves": "Wolves - a pack of 3 wolves (1 big dark wolf + 2 smaller ones), camp is only dead when ALL wolves are gone",
+        "raptors": "Raptors - a group of 6 bird monsters (1 big red raptor + 5 small ones), camp is only dead when ALL raptors are gone",
+        "red_buff": "Red Brambleback - a large red golem monster with a glowing red aura",
+        "krugs": "Krugs - rock monsters that split when killed (1 big + 1 medium, then they split into smaller ones)",
+    }
 
-Respond with ONLY this JSON:
-{{"camp_dead": true/false, "confidence": 0.0-1.0, "reason": "<brief reason>"}}"""
+    desc = camp_desc.get(target_camp, target_camp)
+
+    return f"""You're coaching a Hecarim jungle clear in League of Legends.
+
+TARGET: {target_camp}
+WHAT IT LOOKS LIKE: {desc}
+
+Current stats: HP {last_hp_percent:.0f}% | fighting {time_at_camp:.1f}s | YOLO detections: {det_str}
+
+This is a screenshot of the game. Hecarim (a ghostly centaur champion) is clearing jungle camps. Look at the screenshot and tell me:
+- Can you see the {target_camp} monster(s)?
+- Is there a health bar visible?
+- Does the camp area look empty or are monsters still there?
+
+Think out loud briefly, then make the call.
+
+End with: VERDICT: DEAD or VERDICT: ALIVE"""
 
 
 # -----------------------------------------------------------------------------
@@ -120,13 +186,18 @@ class JungleStrategist:
             "Authorization": f"Bearer {API_KEY}"
         }
         self.last_result = None
+        self.stream_callback = None  # Called with each chunk of text
 
-    def _call_grok(self, img: Image.Image, prompt: str) -> Optional[str]:
-        """Call Grok vision API with reasoning model."""
+    def set_stream_callback(self, callback):
+        """Set callback for streaming text updates."""
+        self.stream_callback = callback
+
+    def _call_grok_stream(self, img: Image.Image, prompt: str) -> Optional[str]:
+        """Call Grok vision API with streaming and chain-of-thought reasoning."""
         image_data = encode_image_to_base64(img)
 
         payload = {
-            "model": "grok-4-1-fast-reasoning",  # Use reasoning for better judgment
+            "model": "grok-4-1-fast-reasoning",
             "messages": [
                 {
                     "role": "user",
@@ -139,17 +210,54 @@ class JungleStrategist:
                     ]
                 }
             ],
-            "temperature": 0,
-            "stream": False
+            "temperature": 0.7,
+            "stream": True
         }
 
         try:
-            response = httpx.post(API_URL, json=payload, headers=self.headers, timeout=30.0)
-            response.raise_for_status()
-            result = response.json()
-            return result["choices"][0]["message"]["content"]
+            full_content = ""
+            full_reasoning = ""
+            with httpx.Client(timeout=120.0) as client:
+                with client.stream("POST", API_URL, json=payload, headers=self.headers) as response:
+                    response.raise_for_status()
+                    buffer = ""
+                    for chunk in response.iter_text():
+                        buffer += chunk
+                        # Process complete lines
+                        while "\n" in buffer:
+                            line, buffer = buffer.split("\n", 1)
+                            line = line.strip()
+                            if not line or line == "data: [DONE]":
+                                continue
+                            if line.startswith("data: "):
+                                try:
+                                    data = json.loads(line[6:])
+                                    choices = data.get("choices", [])
+                                    if choices:
+                                        delta = choices[0].get("delta", {})
+                                        # Check for reasoning content (chain of thought)
+                                        reasoning = delta.get("reasoning_content", "")
+                                        if reasoning:
+                                            full_reasoning += reasoning
+                                            if self.stream_callback:
+                                                self.stream_callback(reasoning, full_reasoning)
+                                        # Regular content
+                                        content = delta.get("content", "")
+                                        if content:
+                                            full_content += content
+                                            if self.stream_callback:
+                                                self.stream_callback(content, full_reasoning + "\n---\n" + full_content)
+                                except json.JSONDecodeError:
+                                    pass
+
+            # Return both reasoning and content
+            if full_reasoning:
+                return full_reasoning + "\n---\n" + full_content
+            return full_content
         except Exception as e:
             print(f"Grok API error: {e}")
+            import traceback
+            traceback.print_exc()
             return None
 
     def verify_camp_cleared(
@@ -160,34 +268,50 @@ class JungleStrategist:
         last_hp_percent: Optional[float],
         detections: list,
         current_zone: Optional[str],
-        game_time: Optional[str] = None
+        game_time: Optional[str] = None,
+        zone_probs: dict = None,
+        map_side: str = "unknown"
     ) -> dict:
         """
         Ask Grok: Is this camp dead? Should we move to next?
 
         Returns: {"camp_dead": bool, "confidence": float, "reason": str}
         """
+        # Check if game time is early (before 1:30) - tell Grok to plan instead
+        game_secs = parse_game_time(game_time)
+        is_early_game = game_secs is not None and game_secs < 90
+
         prompt = build_camp_verify_prompt(
             target_camp=target_camp,
             time_at_camp=time_at_camp,
             last_hp_percent=last_hp_percent if last_hp_percent else 100.0,
             detections=detections,
             current_zone=current_zone,
-            game_time=game_time
+            game_time=game_time,
+            zone_probs=zone_probs,
+            map_side=map_side,
+            is_early_game=is_early_game
         )
 
-        response = self._call_grok(img, prompt)
+        response = self._call_grok_stream(img, prompt)
         if not response:
             # API failed - be conservative, assume camp NOT dead
-            return {"camp_dead": False, "confidence": 0.0, "reason": "API error - assuming not dead"}
+            return {"camp_dead": False, "confidence": 0.0, "reason": "API error"}
 
+        # Try to extract verdict from response
+        result = extract_verdict_from_response(response)
+        if result:
+            self.last_result = result
+            return result
+
+        # Fallback to JSON extraction
         result = extract_json_from_response(response)
         if result and "camp_dead" in result:
             self.last_result = result
             return result
 
         # Couldn't parse response - be conservative
-        return {"camp_dead": False, "confidence": 0.0, "reason": "Parse error - assuming not dead"}
+        return {"camp_dead": False, "confidence": 0.5, "reason": "No clear verdict"}
 
     def close(self):
         """Clean up."""
