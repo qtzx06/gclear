@@ -15,10 +15,12 @@ datasets/
 *.engine
 
 # Data (large files)
-data/raw/*.mov
-data/raw/*.mp4
+data/raw/
+debug_frames/
 *.mov
 *.mp4
+*.png
+!data_collection/*.png
 
 # Roboflow
 *.rf.*
@@ -26,6 +28,7 @@ data/raw/*.mp4
 # macOS
 .DS_Store
 ._*
+*.app/
 
 # IDE
 .vscode/

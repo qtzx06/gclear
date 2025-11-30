@@ -12,8 +12,32 @@ from PyQt6.QtWidgets import (
 )
 from PyQt6.QtCore import Qt, QPoint, QRect, QSize
 from PyQt6.QtGui import QPainter, QColor, QPen, QFont, QPixmap, QImage
+import Quartz
+from PIL import Image
 
 from config import SCREEN_WIDTH, SCREEN_HEIGHT, ROIS, ROI_COLORS
+
+
+def capture_screen() -> QPixmap:
+    """Capture current screen and return as QPixmap."""
+    region = Quartz.CGRectMake(0, 0, SCREEN_WIDTH, SCREEN_HEIGHT)
+    image_ref = Quartz.CGWindowListCreateImage(
+        region,
+        Quartz.kCGWindowListOptionOnScreenOnly,
+        Quartz.kCGNullWindowID,
+        Quartz.kCGWindowImageDefault
+    )
+
+    width = Quartz.CGImageGetWidth(image_ref)
+    height = Quartz.CGImageGetHeight(image_ref)
+    bytes_per_row = Quartz.CGImageGetBytesPerRow(image_ref)
+
+    data_provider = Quartz.CGImageGetDataProvider(image_ref)
+    data = Quartz.CGDataProviderCopyData(data_provider)
+
+    # Convert to QImage then QPixmap
+    qimg = QImage(data, width, height, bytes_per_row, QImage.Format.Format_RGBX8888)
+    return QPixmap.fromImage(qimg.copy())
 
 
 class CalibrationWidget(QWidget):
@@ -252,7 +276,12 @@ class CalibrationWindow(QMainWindow):
         controls = QWidget()
         ctrl_layout = QVBoxLayout(controls)
 
-        # Load image
+        # Capture/Load buttons
+        capture_btn = QPushButton("Capture Screen")
+        capture_btn.setStyleSheet("background-color: #2196F3; color: white; padding: 8px;")
+        capture_btn.clicked.connect(self.capture_live)
+        ctrl_layout.addWidget(capture_btn)
+
         load_btn = QPushButton("Load Screenshot")
         load_btn.clicked.connect(self.load_image)
         ctrl_layout.addWidget(load_btn)
@@ -301,11 +330,14 @@ class CalibrationWindow(QMainWindow):
         ctrl_layout.addStretch()
         layout.addWidget(controls, stretch=1)
 
-        # Try to load a frame around the middle of the dataset
-        frames = sorted(Path("data/raw/hecarim_clear").glob("*.png"))
-        if frames:
-            idx = min(30, len(frames) - 1)
-            self.canvas.load_image(str(frames[idx]))
+        # Capture screen on startup
+        self.capture_live()
+
+    def capture_live(self):
+        """Capture current screen."""
+        pixmap = capture_screen()
+        self.canvas.pixmap = pixmap
+        self.canvas.update()
 
     def load_image(self):
         path, _ = QFileDialog.getOpenFileName(self, "Load Screenshot", "data/raw", "Images (*.png *.jpg)")
