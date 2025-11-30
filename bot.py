@@ -18,6 +18,9 @@ import cv2
 import numpy as np
 import pytesseract
 
+# Set tesseract path for macOS
+pytesseract.pytesseract.tesseract_cmd = "/opt/homebrew/bin/tesseract"
+
 from data_collection.config import (
     SCREEN_WIDTH, SCREEN_HEIGHT, ROIS, MINIMAP_ZONES
 )
@@ -30,7 +33,9 @@ RUNS_DIR = "runs"
 class State(Enum):
     IDLE = auto()
     WALK_TO_CAMP = auto()
+    APPROACH_CAMP = auto()  # Right-click to get in range
     ATTACK_CAMP = auto()
+    KITING = auto()         # Kite while clearing (< 50% HP)
     WAIT_RESPAWN = auto()
 
 
@@ -57,6 +62,28 @@ CAMP_CLASSES = {
     "krugs": "krugs",
 }
 
+# Hecarim ability config
+ABILITY_KEYS = {"Q": "q", "W": "w", "E": "e", "R": "r"}
+LEVEL_UP_KEYS = {"Q": "ctrl+q", "W": "ctrl+w", "E": "ctrl+e", "R": "ctrl+r"}
+
+# Level up after each camp: camp_index -> ability to level
+LEVEL_UP_ORDER = {
+    0: None,      # Start with Q already (level 1)
+    1: "W",       # After blue -> level W
+    2: "Q",       # After gromp -> level Q
+    3: "Q",       # After wolves -> level Q
+    4: "W",       # After raptors -> level W
+    5: "E",       # After red -> level E (level 5)
+    6: "Q",       # After krugs -> level Q (level 6)
+}
+
+# Q cooldown (Hecarim Q is 4 seconds base)
+Q_COOLDOWN = 4.0
+
+# Kiting config
+KITE_THRESHOLD = 50.0  # Start kiting below this HP %
+ATTACK_MOVE_INTERVAL = 0.3  # Seconds between A-clicks while kiting
+
 
 class JungleBot:
     def __init__(self, model_path: str = "models/hecarim.pt"):
@@ -68,6 +95,10 @@ class JungleBot:
         self.action_cooldown = 0.5  # seconds between actions
         self.frame_count = 0
         self.logs = []
+        self.last_q_time = 0  # Track Q cooldown
+        self.in_combat = False
+        self.last_attack_move_time = 0  # Track attack-move timing for kiting
+        self.camp_selected = False  # Track if we've left-clicked to show health bar
 
         # Set up run directory with timestamp
         self.run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -170,22 +201,58 @@ class JungleBot:
         """Read game timer from timer ROI."""
         try:
             roi = self.get_roi_image(img, "timer")
+            # Save for debugging first few frames
+            if self.frame_count < 3:
+                roi.save(f"{self.run_dir}/debug_timer_{self.frame_count}.png")
             roi = roi.convert("L")
             roi = ImageOps.invert(roi)
             text = pytesseract.image_to_string(roi, config="--psm 7 -c tessedit_char_whitelist=0123456789:").strip()
             match = re.search(r"(\d{1,2}:\d{2})", text)
-            return match.group(1) if match else None
-        except Exception:
+            return match.group(1) if match else text if text else None
+        except Exception as e:
+            print(f"OCR error: {e}")
             return None
 
-    def ocr_camp_health(self, img: Image.Image) -> Optional[int]:
-        """Read camp health from camp_info ROI."""
+    def ocr_camp_health(self, img: Image.Image) -> Optional[dict]:
+        """Read camp health from camp_info ROI. Returns dict with current, max, percent."""
         try:
             roi = self.get_roi_image(img, "camp_info")
+
+            # Better preprocessing for health bar
             roi = roi.convert("L")
-            text = pytesseract.image_to_string(roi, config="--psm 7 -c tessedit_char_whitelist=0123456789").strip()
-            nums = re.findall(r"\d+", text)
-            return int(nums[0]) if nums else None
+            # Increase contrast
+            roi = ImageOps.autocontrast(roi)
+            # Threshold to make text cleaner
+            roi = roi.point(lambda x: 255 if x > 128 else 0)
+
+            # OCR with slash allowed
+            text = pytesseract.image_to_string(
+                roi,
+                config="--psm 7 -c tessedit_char_whitelist=0123456789/"
+            ).strip()
+
+            current, max_hp = None, None
+
+            # Try to find xx/xx pattern
+            match = re.search(r"(\d+)\s*/\s*(\d+)", text)
+            if match:
+                current, max_hp = int(match.group(1)), int(match.group(2))
+            else:
+                # If no slash found, try to split a long number in half
+                nums = re.findall(r"\d+", text)
+                if nums:
+                    num_str = nums[0]
+                    if len(num_str) >= 4 and len(num_str) % 2 == 0:
+                        mid = len(num_str) // 2
+                        first, second = num_str[:mid], num_str[mid:]
+                        if first == second or abs(int(first) - int(second)) < int(second) * 0.5:
+                            current, max_hp = int(first), int(second)
+
+            if current is not None and max_hp is not None and max_hp > 0:
+                percent = round((current / max_hp) * 100, 1)
+                return {"current": current, "max": max_hp, "percent": percent, "text": f"{current}/{max_hp}"}
+
+            return None
         except Exception:
             return None
 
@@ -201,6 +268,57 @@ class JungleBot:
         self.last_action_time = time.time()
         btn_name = 'right' if right else 'left'
         print(f"  -> Click ({btn_name}) at ({x}, {y})")
+
+    def press_key(self, key: str):
+        """Press a key using cliclick."""
+        try:
+            # cliclick t: for typing single characters
+            subprocess.run(["/opt/homebrew/bin/cliclick", f"t:{key}"], check=True)
+            print(f"  -> Key: {key}")
+        except Exception as e:
+            print(f"  -> Key error: {e}")
+
+    def press_ability(self, ability: str):
+        """Press an ability key (Q, W, E, R)."""
+        key = ABILITY_KEYS.get(ability)
+        if key:
+            self.press_key(key)
+
+    def level_up_ability(self, ability: str):
+        """Level up an ability (cmd+Q, etc)."""
+        try:
+            key = ABILITY_KEYS.get(ability)
+            if key:
+                # cliclick: kd for key down, t for type, ku for key up (cmd = command)
+                subprocess.run(["/opt/homebrew/bin/cliclick", "kd:cmd", f"t:{key}", "ku:cmd"], check=True)
+                print(f"  -> Level up: {ability}")
+        except Exception as e:
+            print(f"  -> Level up error: {e}")
+
+    def use_q_if_ready(self):
+        """Use Q if off cooldown."""
+        if time.time() - self.last_q_time >= Q_COOLDOWN:
+            self.press_ability("Q")
+            self.last_q_time = time.time()
+
+    def attack_move(self, x: int, y: int):
+        """Attack-move: press A, then left-click at position."""
+        if time.time() - self.last_attack_move_time < ATTACK_MOVE_INTERVAL:
+            return
+        try:
+            # Press A, then click at position
+            subprocess.run(["/opt/homebrew/bin/cliclick", "t:a", f"c:{x},{y}"], check=True)
+            self.last_attack_move_time = time.time()
+            print(f"  -> Attack-move to ({x}, {y})")
+        except Exception as e:
+            print(f"  -> Attack-move error: {e}")
+
+    def get_next_camp_zone(self) -> Optional[str]:
+        """Get the next camp in clear order."""
+        next_idx = self.camp_index + 1
+        if next_idx < len(CLEAR_ORDER):
+            return CLEAR_ORDER[next_idx]
+        return None
 
     def show_debug(self, img: Image.Image, detections: list[Detection], mm_pos, current_zone, game_time=None, camp_health=None):
         """Show debug window with detections."""
@@ -236,7 +354,8 @@ class JungleBot:
         # Status text
         cv2.putText(frame, f"State: {self.state.name} | Zone: {current_zone} | Target: {self.target_camp}",
                     (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
-        cv2.putText(frame, f"Time: {game_time} | Camp HP: {camp_health}",
+        hp_display = f"{camp_health['text']} ({camp_health['percent']}%)" if camp_health else "None"
+        cv2.putText(frame, f"Time: {game_time} | HP: {hp_display}",
                     (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
 
         # Save frame as PNG
@@ -280,7 +399,8 @@ class JungleBot:
         }
         self.logs.append(log_entry)
 
-        print(f"State: {self.state.name} | Zone: {current_zone} | Target: {self.target_camp} | Time: {game_time} | Health: {camp_health} | Detections: {[d.cls for d in detections]}")
+        hp_str = f"{camp_health['text']} ({camp_health['percent']}%)" if camp_health else None
+        print(f"State: {self.state.name} | Zone: {current_zone} | Target: {self.target_camp} | Time: {game_time} | HP: {hp_str} | Detections: {[d.cls for d in detections]}")
 
         if self.state == State.IDLE:
             # Start clearing
@@ -302,10 +422,23 @@ class JungleBot:
         elif self.state == State.ATTACK_CAMP:
             camp = self.find_camp_on_screen(detections, self.target_camp)
             if camp:
-                # Click to attack
-                self.click(camp.x, camp.y, right=True)
+                # Left click first to show health bar, then right click to attack
+                if not self.in_combat:
+                    self.click(camp.x, camp.y, right=False)  # Left click to select
+                    self.in_combat = True
+                else:
+                    self.click(camp.x, camp.y, right=True)  # Right click to attack
+                # Spam Q during combat
+                self.use_q_if_ready()
             else:
                 # Camp dead or not visible - move to next
+                if self.in_combat:
+                    # Just finished a camp - level up ability
+                    ability_to_level = LEVEL_UP_ORDER.get(self.camp_index)
+                    if ability_to_level:
+                        self.level_up_ability(ability_to_level)
+                    self.in_combat = False
+
                 self.camp_index += 1
                 if self.camp_index < len(CLEAR_ORDER):
                     self.target_camp = CLEAR_ORDER[self.camp_index]

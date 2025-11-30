@@ -6,7 +6,7 @@ GAME_REGION = (0, 0, SCREEN_WIDTH, SCREEN_HEIGHT)
 
 # ROI definitions (left, top, width, height)
 ROIS = {
-    "camp_info": (80, 68, 164, 84),
+    "camp_info": (132, 72, 104, 36),
     "timer": (1648, 64, 50, 32),
     "minimap": (1336, 658, 370, 360),
 }
