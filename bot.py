@@ -37,9 +37,8 @@ DEBUG_RECORD = True  # Save debug frames
 RUNS_DIR = "runs"
 
 # Strategist config
-USE_STRATEGIST = False  # Disabled - focus on state machine first
-GROK_QUEUE_SIZE = 2  # Max pending frames for Grok (drop old if full)
-PLANNER_INTERVAL = 50  # Call deep reasoning planner every N frames
+USE_STRATEGIST = True  # Enabled - Grok verifies camp clears
+GROK_QUEUE_SIZE = 2  # Max pending frames for Grok
 
 
 class State(Enum):
@@ -101,12 +100,22 @@ LEVEL_UP_ORDER = {
 }
 
 # Ability cooldowns
-Q_COOLDOWN = 3.64  # Q level 1
+Q_COOLDOWN = 3.9  # Q level 1 (slightly padded)
 W_COOLDOWN = 12.73
 
 # Game timing constants
 CAMP_SPAWN_TIME = 90  # 1:30 in seconds
 EARLY_GAME_END = 15   # First 15 seconds for buying
+
+# Camp max HP values (hardcoded for reliable filtering)
+CAMP_MAX_HP = {
+    "blue_buff": 2300,
+    "gromp": 2050,
+    "wolves": 1600,
+    "raptors": 1200,
+    "red_buff": 2300,
+    "krugs": 1400,
+}
 
 
 def parse_game_time(time_str: str) -> int:
@@ -122,9 +131,9 @@ def parse_game_time(time_str: str) -> int:
     return 0
 
 # Kiting config
-KITE_THRESHOLD = 50.0  # Start kiting below this HP %
+KITE_THRESHOLD = 30.0  # Start kiting below this HP %
 ATTACK_MOVE_INTERVAL = 0.3  # Seconds between A-clicks while kiting
-HP_SMOOTHING_FRAMES = 2  # Average HP over this many frames before triggering kite
+HP_SMOOTHING_FRAMES = 5  # Average HP over this many frames before triggering kite
 
 
 class JungleBot:
@@ -143,8 +152,14 @@ class JungleBot:
         self.last_attack_move_time = 0  # Track attack-move timing for kiting
         self.camp_selected = False  # Track if we've left-clicked to show health bar
         self.hp_history = []  # Track recent HP readings for smoothing
-        self.expected_max_hp = None  # Track expected max HP for current camp
         self.initial_engage_done = False  # Track if initial attack_click done
+        self.is_kiting = False  # Sticky kiting flag - once triggered, stays until camp cleared
+        self.no_detection_frames = 0  # Count frames without camp detection (for robust clear detection)
+        self.last_known_hp = None  # Last known HP reading for fallback
+        self.camp_engage_time = None  # When we started fighting current camp
+        self.grok_verified_clear = False  # Grok confirmed camp is dead
+        self.combat_frames = 0  # Count frames in combat for Grok timing
+        self.last_grok_request_frame = 0  # Track when we last asked Grok
 
         # Early game tracking
         self.leveled_up_q = False
@@ -159,7 +174,6 @@ class JungleBot:
         self.grok_queue = Queue(maxsize=GROK_QUEUE_SIZE)
         self.grok_thread = None
         self.grok_running = False
-        self.planner_counter = 0
 
         # Set up run directory with timestamp
         self.run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -281,22 +295,51 @@ class JungleBot:
                 return State.WALKING_TO_CAMP
 
         # --- CAMPS HAVE SPAWNED ---
+
+        # If Grok verified camp is dead, transition to cleared
+        if self.grok_verified_clear:
+            return State.CAMP_CLEARED
+
+        # Sticky kiting - once triggered, stay in kiting until Grok confirms cleared
+        if self.is_kiting:
+            if camp_detection:
+                self.no_detection_frames = 0
+                return State.KITING
+            else:
+                # No detection while kiting - need Grok to verify
+                self.no_detection_frames += 1
+                # Don't auto-transition, wait for Grok verification
+                return State.KITING
+
         # Is target camp visible on screen?
         if camp_detection:
+            self.no_detection_frames = 0  # Reset counter
             # Do we have it targeted (health bar showing)?
             if camp_health:
-                hp_pct = camp_health.get('percent', 100)
-                if hp_pct < KITE_THRESHOLD and self.get_next_camp_zone():
+                # Track when we started fighting
+                if self.camp_engage_time is None:
+                    self.camp_engage_time = time.time()
+
+                # Use 5-frame smoothed HP for kite decision
+                smoothed_hp = self.get_smoothed_hp(camp_health)
+                if smoothed_hp is not None and smoothed_hp < KITE_THRESHOLD and self.get_next_camp_zone():
+                    self.is_kiting = True  # Set sticky flag
                     return State.KITING
                 return State.ATTACKING
             else:
                 # Camp visible but not targeted - engage it
                 return State.ENGAGING
         else:
-            # Camp not visible
+            # Camp not visible - count frames
+            self.no_detection_frames += 1
+
             if current_zone == target_camp:
-                # We're at the zone but camp not detected - it's dead
-                return State.CAMP_CLEARED
+                # We're at the zone but camp not detected - wait for Grok verification
+                if self.in_combat or self.is_kiting:
+                    # Stay in current state, Grok will verify if dead
+                    return State.KITING if self.is_kiting else State.ATTACKING
+                else:
+                    return State.ENGAGING  # Try to re-engage
             else:
                 # Need to walk there
                 return State.WALKING_TO_CAMP
@@ -326,6 +369,10 @@ class JungleBot:
             log_overlay("Bought starter item")
 
         elif state == State.WALKING_TO_CAMP:
+            # Level up W when walking to gromp (after blue)
+            if self.target_camp == "gromp" and self.camp_index == 1:
+                self.level_up_ability("W")
+
             # Click minimap to walk to target camp
             if self.can_act():
                 region = get_region(f"mm_{self.target_camp.replace('_buff', '')}")
@@ -346,6 +393,13 @@ class JungleBot:
 
         elif state == State.ATTACKING:
             # In combat - spam attacks and abilities
+            # Find player position from detections
+            player_pos = None
+            for d in detections:
+                if d.cls == "player":
+                    player_pos = (d.x, d.y)
+                    break
+
             if camp_detection:
                 if not self.initial_engage_done:
                     # Initial attack
@@ -354,8 +408,8 @@ class JungleBot:
                     self.initial_engage_done = True
                     self.in_combat = True
                 else:
-                    # Continue attacking with A-clicks
-                    self.attack_move_click(camp_detection.x, camp_detection.y)
+                    # Continue attacking with A-clicks near player
+                    self.attack_move_click(camp_detection.x, camp_detection.y, player_pos=player_pos)
 
                 # Use abilities on cooldown
                 self.use_q_if_ready()
@@ -372,11 +426,6 @@ class JungleBot:
                 kite_x, kite_y = self.get_kite_direction(mm_pos, next_camp)
                 self.kite_move(kite_x, kite_y)
                 self.use_q_if_ready()
-
-            # Spam level up W while kiting blue buff (blue about to die)
-            if self.target_camp == "blue_buff":
-                self.level_up_ability("W")
-                log_overlay("Level up W (kiting blue)")
 
         elif state == State.CAMP_CLEARED:
             # Camp is dead, advance to next
@@ -423,15 +472,18 @@ class JungleBot:
             return None
 
     def ocr_camp_health(self, img: Image.Image) -> Optional[dict]:
-        """Read camp health from camp_info ROI. Returns dict with current, max, percent."""
+        """Read camp health from camp_info ROI. Returns dict with current, max, percent.
+
+        NEVER returns None while in combat - uses fallback values instead.
+        """
+        expected_max = CAMP_MAX_HP.get(self.target_camp, 2300)
+
         try:
             roi = self.get_roi_image(img, "camp_info")
 
             # Better preprocessing for health bar
             roi = roi.convert("L")
-            # Increase contrast
             roi = ImageOps.autocontrast(roi)
-            # Threshold to make text cleaner
             roi = roi.point(lambda x: 255 if x > 128 else 0)
 
             # OCR with slash allowed
@@ -447,63 +499,62 @@ class JungleBot:
             if match:
                 current, max_hp = int(match.group(1)), int(match.group(2))
             else:
-                # If no slash found, try to split a long number in half
+                # If no slash found, try to find just a current HP number
                 nums = re.findall(r"\d+", text)
                 if nums:
-                    num_str = nums[0]
-                    if len(num_str) >= 4 and len(num_str) % 2 == 0:
-                        mid = len(num_str) // 2
-                        first, second = num_str[:mid], num_str[mid:]
-                        if first == second or abs(int(first) - int(second)) < int(second) * 0.5:
-                            current, max_hp = int(first), int(second)
+                    for num_str in nums:
+                        num = int(num_str)
+                        if 0 < num <= expected_max:
+                            current = num
+                            max_hp = expected_max
+                            break
+                        elif len(num_str) >= 4:
+                            mid = len(num_str) // 2
+                            first, second = int(num_str[:mid]), int(num_str[mid:])
+                            if abs(second - expected_max) < expected_max * 0.2:
+                                current = first
+                                max_hp = expected_max
+                                break
 
             if current is not None and max_hp is not None and max_hp > 0:
-                # Sanity checks
-                if current > max_hp:
-                    return None
-                if max_hp < 200 or max_hp > 10000:
-                    return None
+                # Use hardcoded max HP if close to expected
+                if abs(max_hp - expected_max) < expected_max * 0.3:
+                    max_hp = expected_max
 
-                # Max HP should never increase (use lowest seen)
-                if self.expected_max_hp is not None:
-                    max_hp = min(max_hp, self.expected_max_hp)
-                self.expected_max_hp = max_hp
+                # Cap current at max
+                current = min(current, max_hp)
+                current = max(0, current)
 
                 # Current HP should never increase during combat
-                if self.in_combat and self.hp_history:
-                    last_current = self.hp_history[-1] if self.hp_history else current
-                    # If current is way higher than last, it's probably OCR error
-                    if current > last_current * 1.1:  # Allow 10% tolerance
-                        current = int(last_current * 0.95)  # Estimate slight decrease
+                if self.in_combat and self.last_known_hp is not None:
+                    if current > self.last_known_hp["current"] * 1.1:
+                        current = int(self.last_known_hp["current"] * 0.95)
 
                 percent = round((current / max_hp) * 100, 1)
-                return {"current": current, "max": max_hp, "percent": percent, "text": f"{current}/{max_hp}"}
+                result = {"current": current, "max": max_hp, "percent": percent, "text": f"{current}/{max_hp}"}
+                self.last_known_hp = result
+                return result
 
-            return None
         except Exception as e:
             print(f"OCR error: {e}")
-            return None
 
-    def _validate_hp_reading(self, current: int, max_hp: int) -> bool:
-        """Validate OCR HP reading for sanity."""
-        # Current can't exceed max
-        if current > max_hp:
-            return False
+        # --- FALLBACK LOGIC: Never return None while in combat ---
+        if self.in_combat or self.is_kiting:
+            if self.last_known_hp is not None:
+                # Estimate HP decay (lose ~3% per frame while fighting)
+                last_pct = self.last_known_hp["percent"]
+                new_pct = max(0, last_pct - 3.0)
+                new_current = int((new_pct / 100) * expected_max)
+                result = {"current": new_current, "max": expected_max, "percent": new_pct, "text": f"{new_current}/{expected_max}*"}
+                self.last_known_hp = result
+                return result
+            else:
+                # No history - assume full HP
+                result = {"current": expected_max, "max": expected_max, "percent": 100.0, "text": f"{expected_max}/{expected_max}*"}
+                self.last_known_hp = result
+                return result
 
-        # Max HP should be reasonable (camps have 1000-6000 HP typically)
-        if max_hp < 500 or max_hp > 10000:
-            return False
-
-        # If we have an expected max HP, new reading should be close
-        if self.expected_max_hp is not None:
-            # Allow 10% variance in max HP reading
-            if abs(max_hp - self.expected_max_hp) > self.expected_max_hp * 0.15:
-                return False
-        else:
-            # First reading - set expected max HP
-            self.expected_max_hp = max_hp
-
-        return True
+        return None
 
     def click(self, x: int, y: int, right: bool = False):
         """Click at screen position using cliclick."""
@@ -540,19 +591,23 @@ class JungleBot:
 
         self.last_action_time = time.time()
 
-    def attack_move_click(self, x: int, y: int):
-        """A + left-click spam with cursor spasm for style and effectiveness."""
+    def attack_move_click(self, x: int, y: int, player_pos: tuple = None):
+        """A + left-click near player position with small movement."""
         if not self.can_act():
             return
-        # Spam A-clicks with random offsets for spasm effect
-        for _ in range(4):
+
+        # Use player position if available, otherwise target position
+        px, py = player_pos if player_pos else (x, y)
+
+        # A-clicks close to player with small random offset
+        for _ in range(3):
             ox = random.randint(-30, 30)
             oy = random.randint(-30, 30)
-            cx, cy = x + ox, y + oy
+            cx, cy = px + ox, py + oy
             subprocess.run(["/opt/homebrew/bin/cliclick", "t:a", f"c:{cx},{cy}"], check=True)
-            time.sleep(0.03)
+            time.sleep(0.04)
+
         self.last_action_time = time.time()
-        print(f"  -> A-click spam at ({x}, {y})")
 
     def press_key(self, key: str):
         """Press a key using cliclick."""
@@ -647,8 +702,6 @@ class JungleBot:
             self.hp_history = [100.0, 100.0]
         else:
             self.hp_history = []
-        # Reset expected max HP for new camp
-        self.expected_max_hp = None
 
     def kite_move(self, x: int, y: int):
         """Kite: right-click to walk, then A+click to attack while moving."""
@@ -697,14 +750,14 @@ class JungleBot:
         # Player is roughly center of screen, click in that direction
         screen_center_x = SCREEN_WIDTH // 2
         screen_center_y = SCREEN_HEIGHT // 2
-        kite_distance = 450  # pixels from center to click
+        kite_distance = 600  # pixels from center to click (aggressive kite)
 
         click_x = int(screen_center_x + dx * kite_distance)
         click_y = int(screen_center_y + dy * kite_distance)
 
-        # Clamp to screen bounds
-        click_x = max(50, min(SCREEN_WIDTH - 50, click_x))
-        click_y = max(50, min(SCREEN_HEIGHT - 50, click_y))
+        # Clamp to screen bounds (allow closer to edges)
+        click_x = max(20, min(SCREEN_WIDTH - 20, click_x))
+        click_y = max(20, min(SCREEN_HEIGHT - 20, click_y))
 
         return (click_x, click_y)
 
@@ -871,15 +924,23 @@ class JungleBot:
 
     def _finish_camp(self):
         """Called when a camp is cleared - level up and move to next."""
-        if self.in_combat:
-            # Level up ability after this camp
-            ability_to_level = LEVEL_UP_ORDER.get(self.camp_index)
-            if ability_to_level:
-                self.level_up_ability(ability_to_level)
-            self.in_combat = False
-            self.camp_selected = False
-            self.initial_engage_done = False  # Reset for next camp
-            self.reset_hp_history()  # Clear HP history for next camp
+        # Level up ability after this camp
+        ability_to_level = LEVEL_UP_ORDER.get(self.camp_index)
+        if ability_to_level:
+            self.level_up_ability(ability_to_level)
+
+        # Reset all combat/camp state
+        self.in_combat = False
+        self.camp_selected = False
+        self.initial_engage_done = False
+        self.is_kiting = False
+        self.no_detection_frames = 0
+        self.last_known_hp = None
+        self.camp_engage_time = None
+        self.grok_verified_clear = False
+        self.combat_frames = 0
+        self.last_grok_request_frame = 0
+        self.reset_hp_history()
 
         self.camp_index += 1
         if self.camp_index < len(CLEAR_ORDER):
@@ -891,11 +952,10 @@ class JungleBot:
             print("Clear complete!")
 
     def _grok_worker(self):
-        """Background thread for Grok API calls."""
-        print("[GROK THREAD] Started")
+        """Background thread for Grok camp verification."""
+        print("[GROK THREAD] Started - Camp Clear Verifier")
         while self.grok_running:
             try:
-                # Wait for frame data (with timeout so we can check grok_running)
                 frame_data = self.grok_queue.get(timeout=0.5)
             except Empty:
                 continue
@@ -904,58 +964,32 @@ class JungleBot:
                 break
 
             try:
-                # Unpack frame data
-                som_img = frame_data["som_img"]
-                camp_health = frame_data["camp_health"]
-                state_name = frame_data["state_name"]
-                target_camp = frame_data["target_camp"]
-                detections = frame_data["detections"]
-                current_zone = frame_data["current_zone"]
-                game_time = frame_data["game_time"]
-                is_planner = frame_data.get("is_planner", False)
+                # Call Grok to verify if camp is cleared
+                result = self.strategist.verify_camp_cleared(
+                    img=frame_data["img"],
+                    target_camp=frame_data["target_camp"],
+                    time_at_camp=frame_data["time_at_camp"],
+                    last_hp_percent=frame_data["last_hp_percent"],
+                    detections=frame_data["detections"],
+                    current_zone=frame_data["current_zone"],
+                    game_time=frame_data["game_time"]
+                )
 
-                if is_planner:
-                    # Deep planner call
-                    plan = self.strategist.plan(
-                        img=som_img,
-                        recent_logs=self.logs[-10:],
-                        current_state=state_name,
-                        target_camp=target_camp
-                    )
-                    plan_short = plan[:80] + "..." if len(plan) > 80 else plan
-                    print(f"[GROK THREAD] PLANNER: {plan_short}")
-                    # Store for main thread to display (Qt must update from main thread)
-                    with self.grok_decision_lock:
-                        self.last_grok_message = f"[PLAN] {plan_short}"
-                else:
-                    # Advisory analysis (Grok observes, doesn't control)
-                    raw_response = self.strategist.decide(
-                        img=som_img,
-                        ocr_health=camp_health,
-                        current_state=state_name,
-                        target_camp=target_camp,
-                        detections=detections,
-                        current_zone=current_zone,
-                        game_time=game_time
-                    )
+                camp_dead = result.get("camp_dead", False)
+                confidence = result.get("confidence", 0.0)
+                reason = result.get("reason", "")
 
-                    if raw_response:
-                        analysis = raw_response.get('analysis', '')
-                        issue = raw_response.get('issue')
-                        tip = raw_response.get('tip')
+                # Display result
+                status = "DEAD" if camp_dead else "ALIVE"
+                grok_msg = f"[GROK] {frame_data['target_camp']}: {status} ({confidence:.0%}) - {reason}"
+                print(grok_msg)
 
-                        # Build display message
-                        lines = [f"[ANALYSIS] {analysis}"]
-                        if issue:
-                            lines.append(f"[ISSUE] {issue}")
-                        if tip:
-                            lines.append(f"[TIP] {tip}")
-
-                        grok_msg = "\n".join(lines)
-                        print(f"[GROK] {analysis}")
-
-                        with self.grok_decision_lock:
-                            self.last_grok_message = grok_msg
+                with self.grok_decision_lock:
+                    self.last_grok_message = grok_msg
+                    # If Grok says camp is dead with high confidence, set flag
+                    if camp_dead and confidence >= 0.7:
+                        self.grok_verified_clear = True
+                        print(f"[GROK] VERIFIED CLEAR: {frame_data['target_camp']}")
 
             except Exception as e:
                 print(f"[GROK THREAD] Error: {e}")
@@ -1077,40 +1111,62 @@ class JungleBot:
         )
 
         # --- USE W WHEN APPROACHING CAMP (distance-based) ---
-        W_APPROACH_DISTANCE = 25  # Minimap pixels - activate W when this close
+        W_APPROACH_DISTANCE = 12  # Minimap pixels - activate W when very close
         if self.camp_index >= 1 and mm_pos:  # After blue, we have W leveled
             dist = self.distance_to_camp(mm_pos, self.target_camp)
             if dist < W_APPROACH_DISTANCE:
                 self.use_w_if_ready()
 
-        # --- QUEUE FRAME FOR GROK (advisory/logging only) ---
-        if self.strategist:
-            self.planner_counter += 1
-            is_planner = (self.planner_counter % PLANNER_INTERVAL == 0) and self.planner_counter > 0
+        # --- GROK CAMP VERIFICATION ---
+        # Count combat frames and ask Grok periodically
+        if self.in_combat or self.is_kiting:
+            self.combat_frames += 1
 
-            # Only queue occasionally to reduce load
-            if self.frame_count % 5 == 0 or is_planner:
-                som_img = draw_som_overlay(img, detections)
+            # Ask Grok every 15 frames during combat, or immediately if no detection
+            GROK_INTERVAL = 15  # Ask every 15 frames (~3 seconds at 0.2s tick)
+            frames_since_last = self.frame_count - self.last_grok_request_frame
+            should_ask = (
+                self.strategist and
+                not self.grok_verified_clear and
+                (frames_since_last >= GROK_INTERVAL or self.no_detection_frames >= 3)
+            )
+
+            if should_ask:
+                self.last_grok_request_frame = self.frame_count
+
+                # Calculate time fighting this camp
+                time_at_camp = 0.0
+                if self.camp_engage_time:
+                    time_at_camp = time.time() - self.camp_engage_time
+
+                # Get last known HP percent
+                last_hp_pct = None
+                if self.last_known_hp:
+                    last_hp_pct = self.last_known_hp.get("percent")
+
                 frame_data = {
-                    "som_img": som_img,
-                    "camp_health": camp_health,
-                    "state_name": self.state.name,
+                    "img": img,
                     "target_camp": self.target_camp,
+                    "time_at_camp": time_at_camp,
+                    "last_hp_percent": last_hp_pct,
                     "detections": detections,
                     "current_zone": current_zone,
                     "game_time": game_time,
-                    "is_planner": is_planner,
                 }
 
-                if self.grok_queue.full():
+                # Clear queue and add new request
+                while not self.grok_queue.empty():
                     try:
                         self.grok_queue.get_nowait()
                     except Empty:
-                        pass
+                        break
                 try:
                     self.grok_queue.put_nowait(frame_data)
+                    print(f"  -> Queued Grok verify (combat frame {self.combat_frames})")
                 except:
                     pass
+        else:
+            self.combat_frames = 0  # Reset when not in combat
 
         # --- DEBUG/LOGGING ---
         if DEBUG_VIEW or DEBUG_RECORD:
