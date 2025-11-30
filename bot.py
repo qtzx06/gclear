@@ -100,8 +100,9 @@ LEVEL_UP_ORDER = {
     6: "Q",       # After krugs -> level Q (level 6)
 }
 
-# Q cooldown (spam it every second)
-Q_COOLDOWN = 1.0
+# Ability cooldowns
+Q_COOLDOWN = 3.64  # Q level 1
+W_COOLDOWN = 12.73
 
 # Game timing constants
 CAMP_SPAWN_TIME = 90  # 1:30 in seconds
@@ -137,6 +138,7 @@ class JungleBot:
         self.frame_count = 0
         self.logs = []
         self.last_q_time = 0  # Track Q cooldown
+        self.last_w_time = 0  # Track W cooldown
         self.in_combat = False
         self.last_attack_move_time = 0  # Track attack-move timing for kiting
         self.camp_selected = False  # Track if we've left-clicked to show health bar
@@ -147,6 +149,7 @@ class JungleBot:
         # Early game tracking
         self.leveled_up_q = False
         self.bought_item = False
+        self.pressed_hotkey = False  # Ctrl+Shift+O after buying
 
         # Strategist (threaded)
         self.strategist = JungleStrategist() if USE_STRATEGIST else None
@@ -234,6 +237,20 @@ class JungleBot:
         center_x = mm_x + (x1 + x2) // 2
         center_y = mm_y + (y1 + y2) // 2
         return (center_x, center_y)
+
+    def get_minimap_zone_center(self, zone_name: str) -> tuple[int, int]:
+        """Get minimap-relative center coords for a zone."""
+        x1, y1, x2, y2 = MINIMAP_ZONES[zone_name]
+        return ((x1 + x2) // 2, (y1 + y2) // 2)
+
+    def distance_to_camp(self, mm_pos: tuple[int, int], camp_name: str) -> float:
+        """Calculate distance from mm_player to a camp zone on minimap."""
+        if not mm_pos or camp_name not in MINIMAP_ZONES:
+            return 999
+        camp_center = self.get_minimap_zone_center(camp_name)
+        dx = mm_pos[0] - camp_center[0]
+        dy = mm_pos[1] - camp_center[1]
+        return math.sqrt(dx*dx + dy*dy)
 
     def compute_state(
         self,
@@ -340,13 +357,13 @@ class JungleBot:
                     # Continue attacking with A-clicks
                     self.attack_move_click(camp_detection.x, camp_detection.y)
 
-                # Use Q on cooldown
+                # Use abilities on cooldown
                 self.use_q_if_ready()
+                self.use_w_if_ready()
 
-                # Check for smite
-                if camp_health and camp_health.get('current', 9999) < 500:
+                # Spam smite at blue buff and krugs
+                if self.target_camp in ("blue_buff", "krugs"):
                     self.press_key("f")
-                    log_overlay("SMITE!")
 
         elif state == State.KITING:
             # Low HP, kite toward next camp
@@ -355,6 +372,11 @@ class JungleBot:
                 kite_x, kite_y = self.get_kite_direction(mm_pos, next_camp)
                 self.kite_move(kite_x, kite_y)
                 self.use_q_if_ready()
+
+            # Spam level up W while kiting blue buff (blue about to die)
+            if self.target_camp == "blue_buff":
+                self.level_up_ability("W")
+                log_overlay("Level up W (kiting blue)")
 
         elif state == State.CAMP_CLEARED:
             # Camp is dead, advance to next
@@ -436,11 +458,23 @@ class JungleBot:
                             current, max_hp = int(first), int(second)
 
             if current is not None and max_hp is not None and max_hp > 0:
-                # Simplified validation - just sanity checks
+                # Sanity checks
                 if current > max_hp:
                     return None
                 if max_hp < 200 or max_hp > 10000:
                     return None
+
+                # Max HP should never increase (use lowest seen)
+                if self.expected_max_hp is not None:
+                    max_hp = min(max_hp, self.expected_max_hp)
+                self.expected_max_hp = max_hp
+
+                # Current HP should never increase during combat
+                if self.in_combat and self.hp_history:
+                    last_current = self.hp_history[-1] if self.hp_history else current
+                    # If current is way higher than last, it's probably OCR error
+                    if current > last_current * 1.1:  # Allow 10% tolerance
+                        current = int(last_current * 0.95)  # Estimate slight decrease
 
                 percent = round((current / max_hp) * 100, 1)
                 return {"current": current, "max": max_hp, "percent": percent, "text": f"{current}/{max_hp}"}
@@ -546,11 +580,27 @@ class JungleBot:
         except Exception as e:
             print(f"  -> Level up error: {e}")
 
+    def press_ctrl_shift_o(self):
+        """Press Ctrl+Shift+O hotkey."""
+        try:
+            # cliclick: kd/ku for key down/up, ctrl=control, shift=shift
+            subprocess.run(["/opt/homebrew/bin/cliclick", "kd:ctrl", "kd:shift", "t:o", "ku:shift", "ku:ctrl"], check=True)
+            print("  -> Pressed Ctrl+Shift+O")
+        except Exception as e:
+            print(f"  -> Hotkey error: {e}")
+
     def use_q_if_ready(self):
         """Use Q if off cooldown."""
         if time.time() - self.last_q_time >= Q_COOLDOWN:
             self.press_ability("Q")
             self.last_q_time = time.time()
+
+    def use_w_if_ready(self):
+        """Use W if off cooldown."""
+        if time.time() - self.last_w_time >= W_COOLDOWN:
+            self.press_ability("W")
+            self.last_w_time = time.time()
+            print("  -> Used W")
 
     def get_smoothed_hp(self, camp_health: Optional[dict]) -> Optional[float]:
         """Get smoothed HP percentage based on recent readings."""
@@ -741,7 +791,7 @@ class JungleBot:
             else:
                 self.attack_move_click(click_x, click_y)
 
-            self.state = State.ATTACK_CAMP
+            self.state = State.ATTACKING
 
         elif action == "KITE":
             # Start kiting towards next camp
@@ -764,7 +814,7 @@ class JungleBot:
             else:
                 x, y = self.get_zone_center(self.target_camp)
                 self.click(x, y, right=True)
-            self.state = State.WALK_TO_CAMP
+            self.state = State.WALKING_TO_CAMP
 
         elif action == "SMITE":
             # Smite the target
@@ -790,22 +840,34 @@ class JungleBot:
     def _buy_starter_item(self):
         """Open shop, buy Gustwalker Hatchling, close shop."""
         try:
+            print("  -> Opening shop...")
             # Press B to open shop
-            self.press_key("b")
+            subprocess.run(["/opt/homebrew/bin/cliclick", "t:b"], check=True)
+            time.sleep(0.8)  # Wait for shop to fully open
+
+            # Gustwalker Hatchling in recommended items
+            # Right-click to buy (try multiple times)
+            item_pos = (650, 340)  # Between left and center
+            print(f"  -> Clicking item at {item_pos}...")
+            for i in range(3):
+                subprocess.run(["/opt/homebrew/bin/cliclick", f"rc:{item_pos[0]},{item_pos[1]}"], check=True)
+                time.sleep(0.2)
+
             time.sleep(0.3)
 
-            # Gustwalker Hatchling in recommended items - right-click to buy
-            # Position may need calibration based on your shop layout
-            gustwalker_pos = (680, 340)
-            subprocess.run(["/opt/homebrew/bin/cliclick", f"rc:{gustwalker_pos[0]},{gustwalker_pos[1]}"], check=True)
+            # Close shop with B again
+            print("  -> Closing shop...")
+            subprocess.run(["/opt/homebrew/bin/cliclick", "t:b"], check=True)
             time.sleep(0.2)
 
-            # Press B to close shop
-            self.press_key("b")
-            print("  -> Bought Gustwalker Hatchling")
+            print("  -> Bought starter item")
         except Exception as e:
             print(f"  -> Shop error: {e}")
-            self.press_key("b")  # Try to close shop anyway
+            # Try to close shop
+            try:
+                subprocess.run(["/opt/homebrew/bin/cliclick", "t:b"], check=True)
+            except:
+                pass
 
     def _finish_camp(self):
         """Called when a camp is cleared - level up and move to next."""
@@ -822,7 +884,7 @@ class JungleBot:
         self.camp_index += 1
         if self.camp_index < len(CLEAR_ORDER):
             self.target_camp = CLEAR_ORDER[self.camp_index]
-            self.state = State.WALK_TO_CAMP
+            self.state = State.WALKING_TO_CAMP
             print(f"Next camp: {self.target_camp}")
         else:
             self.state = State.IDLE
@@ -1014,6 +1076,13 @@ class JungleBot:
             detections=detections
         )
 
+        # --- USE W WHEN APPROACHING CAMP (distance-based) ---
+        W_APPROACH_DISTANCE = 25  # Minimap pixels - activate W when this close
+        if self.camp_index >= 1 and mm_pos:  # After blue, we have W leveled
+            dist = self.distance_to_camp(mm_pos, self.target_camp)
+            if dist < W_APPROACH_DISTANCE:
+                self.use_w_if_ready()
+
         # --- QUEUE FRAME FOR GROK (advisory/logging only) ---
         if self.strategist:
             self.planner_counter += 1
@@ -1070,14 +1139,21 @@ class JungleBot:
         }
         self.logs.append(log_entry)
 
-        # Status line: [time] STATE | target | HP | detections
+        # Detection line - show what YOLO sees
+        if detections:
+            det_strs = [f"{d.cls}@({d.x},{d.y})" for d in detections[:5]]
+            det_line = "DETECT: " + " | ".join(det_strs)
+        else:
+            det_line = "DETECT: (none)"
+        log_overlay(det_line)
+
+        # Status line: [time] STATE | target | HP
         hp_str = f"{camp_health['current']}/{camp_health['max']}" if camp_health else "-"
-        det_summary = ",".join([d.cls for d in detections[:4]])
         time_str = game_time or "0:00"
         zone_str = current_zone or "?"
 
         status_msg = f"[{time_str}] {self.state.name} | {self.target_camp} @ {zone_str} | HP:{hp_str}"
-        print(status_msg)
+        print(f"{det_line}\n{status_msg}")
         log_overlay(status_msg)
 
         self.frame_count += 1

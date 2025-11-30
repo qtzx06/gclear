@@ -9,24 +9,25 @@ from collections import deque
 
 
 class OverlayWindow(QWidget):
-    """Small always-on-top terminal overlay."""
+    """Minimal always-on-top terminal overlay."""
 
-    def __init__(self, max_lines: int = 15, x: int = 10, y: int = 800, title: str = ""):
+    def __init__(self, max_lines: int = 8, x: int = 10, y: int = 800, width: int = 350, height: int = 140, title: str = ""):
         super().__init__()
         self.max_lines = max_lines
         self.lines = deque(maxlen=max_lines)
         self.pos_x = x
         self.pos_y = y
+        self.width_px = width
+        self.height_px = height
         self.title = title
         self.setup_ui()
 
     def setup_ui(self):
-        # Window flags: always on top, no frame, stays on all workspaces
+        # Window flags: always on top, no frame
         self.setWindowFlags(
             Qt.WindowType.WindowStaysOnTopHint |
             Qt.WindowType.FramelessWindowHint |
-            Qt.WindowType.Tool |
-            Qt.WindowType.X11BypassWindowManagerHint
+            Qt.WindowType.Tool
         )
 
         # Make window semi-transparent and not take focus
@@ -35,37 +36,36 @@ class OverlayWindow(QWidget):
         self.setAttribute(Qt.WidgetAttribute.WA_MacAlwaysShowToolWindow)
 
         # Size and position
-        self.setGeometry(self.pos_x, self.pos_y, 400, 250)
+        self.setGeometry(self.pos_x, self.pos_y, self.width_px, self.height_px)
 
         # Layout
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(5, 5, 5, 5)
-        layout.setSpacing(2)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
 
-        # Title label
-        if self.title:
-            self.title_label = QLabel(self.title)
-            self.title_label.setFont(QFont("Monaco", 9))
-            self.title_label.setStyleSheet("color: #888888; padding: 2px;")
-            layout.addWidget(self.title_label)
-
-        # Text display
+        # Text display (title integrated)
         self.text_edit = QTextEdit()
         self.text_edit.setReadOnly(True)
-        self.text_edit.setFont(QFont("Monaco", 10))
+        self.text_edit.setFont(QFont("Monaco", 9))
+        self.text_edit.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
 
-        # Dark semi-transparent background with white text
+        # Clean dark style
         self.text_edit.setStyleSheet("""
             QTextEdit {
-                background-color: rgba(20, 20, 20, 220);
-                color: #ffffff;
-                border: 1px solid rgba(255, 255, 255, 80);
-                border-radius: 5px;
-                padding: 5px;
+                background-color: rgba(15, 15, 15, 230);
+                color: #e0e0e0;
+                border: 1px solid rgba(80, 80, 80, 150);
+                border-radius: 4px;
+                padding: 4px 6px;
             }
         """)
 
         layout.addWidget(self.text_edit)
+
+        # Add title as first line if provided
+        if self.title:
+            self.lines.append(f"--- {self.title} ---")
+            self.text_edit.setPlainText("\n".join(self.lines))
 
         self.show()
 
@@ -90,15 +90,14 @@ _app = None
 
 
 def init_overlay():
-    """Initialize both overlays (call from main thread before bot starts)."""
+    """Initialize overlays (stacked vertically)."""
     global _status_overlay, _strategist_overlay, _app
     if _status_overlay is None:
         _app = QApplication.instance() or QApplication(sys.argv)
-        # Status overlay on the left
-        _status_overlay = OverlayWindow(max_lines=12, x=10, y=800, title="BOT STATUS")
-        # Strategist overlay on the right
-        _strategist_overlay = OverlayWindow(max_lines=12, x=420, y=800, title="GROK STRATEGIST")
-        _strategist_overlay.log("waiting for first frame...")
+        # Bot status on top
+        _status_overlay = OverlayWindow(max_lines=8, x=10, y=750, width=320, height=130, title="BOT")
+        # Strategist below (hidden when Grok disabled)
+        _strategist_overlay = OverlayWindow(max_lines=6, x=10, y=885, width=320, height=100, title="GROK")
     return _status_overlay
 
 
