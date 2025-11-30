@@ -24,12 +24,12 @@ class Region:
 # =============================================================================
 
 REGIONS = [
-    Region("mm_blue", "Blue Buff", 1440, 838, "Walk to Blue Sentinel"),
+    Region("mm_blue", "Blue Buff", 1425, 838, "Walk to Blue Sentinel"),  # shifted left 15
     Region("mm_gromp", "Gromp", 1408, 829, "Walk to Gromp"),
-    Region("mm_wolves", "Wolves", 1435, 875, "Walk to Wolves"),  # shifted left 4, down 5
-    Region("mm_raptors", "Raptors", 1511, 905, "Walk to Raptors"),  # shifted down 12
-    Region("mm_red", "Red Buff", 1531, 938, "Walk to Red Brambleback"),  # shifted down 14
-    Region("mm_krugs", "Krugs", 1544, 965, "Walk to Krugs"),  # shifted down 15
+    Region("mm_wolves", "Wolves", 1435, 875, "Walk to Wolves"),
+    Region("mm_raptors", "Raptors", 1511, 905, "Walk to Raptors"),
+    Region("mm_red", "Red Buff", 1520, 950, "Walk to Red Brambleback"),  # shifted left 11, down 12
+    Region("mm_krugs", "Krugs", 1544, 965, "Walk to Krugs"),
 ]
 
 REGION_BY_ID = {r.id: r for r in REGIONS}

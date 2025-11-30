@@ -13,11 +13,11 @@ ROIS = {
 
 # Minimap zones (relative to minimap ROI) - (x1, y1, x2, y2)
 MINIMAP_ZONES = {
-    "blue_buff": (82, 160, 126, 200),
+    "blue_buff": (72, 160, 116, 200),    # shifted left 10
     "gromp": (52, 152, 92, 190),
     "wolves": (86, 194, 120, 230),
     "raptors": (158, 218, 192, 252),
-    "red_buff": (176, 250, 214, 282),
+    "red_buff": (166, 258, 204, 290),    # shifted left 10, down 8
     "krugs": (192, 274, 224, 310),
     "spawn": (0, 250, 124, 364),
 }

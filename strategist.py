@@ -91,20 +91,25 @@ def extract_json_from_response(response: str) -> Optional[dict]:
 
 
 def extract_verdict_from_response(response: str) -> dict:
-    """Extract VERDICT from response text."""
-    response_upper = response.upper()
-
-    # Look for VERDICT: DEAD or VERDICT: ALIVE
-    if "VERDICT: DEAD" in response_upper or "VERDICT:DEAD" in response_upper:
-        return {"camp_dead": True, "confidence": 0.9, "reason": "Grok verdict: DEAD"}
-    elif "VERDICT: ALIVE" in response_upper or "VERDICT:ALIVE" in response_upper:
-        return {"camp_dead": False, "confidence": 0.9, "reason": "Grok verdict: ALIVE"}
-    elif "VERDICT: WAITING" in response_upper or "VERDICT:WAITING" in response_upper:
-        return {"camp_dead": False, "confidence": 1.0, "reason": "Waiting for spawn"}
+    """Extract verdict from JSON response."""
+    # Try to parse JSON
+    try:
+        result = extract_json_from_response(response)
+        if result and "dead" in result:
+            return {
+                "camp_dead": result["dead"],
+                "confidence": 0.9,
+                "reason": result.get("reason", "")
+            }
+    except:
+        pass
 
     # Fallback - look for keywords
-    if "camp is dead" in response.lower() or "camp is cleared" in response.lower():
-        return {"camp_dead": True, "confidence": 0.7, "reason": "Inferred dead from text"}
+    response_lower = response.lower()
+    if "dead" in response_lower and "not" not in response_lower:
+        return {"camp_dead": True, "confidence": 0.7, "reason": "Inferred dead"}
+    if "alive" in response_lower or "still" in response_lower:
+        return {"camp_dead": False, "confidence": 0.7, "reason": "Inferred alive"}
 
     return None
 
@@ -136,41 +141,11 @@ def build_camp_verify_prompt(
     else:
         prob_str = "unknown"
 
-    # Early game: camps haven't spawned yet
     if is_early_game:
-        return f"""You're coaching a Hecarim jungle clear. Game time: {game_time} - camps spawn at 1:30.
+        return f"""Is camp dead? Respond ONLY with JSON: {{"dead": false, "reason": "waiting for spawn"}}"""
 
-What do you see? Where's the player heading? Quick thoughts on positioning while we wait.
-
-End with: VERDICT: WAITING"""
-
-    # Camp descriptions for context
-    camp_desc = {
-        "blue_buff": "Blue Sentinel - a large blue golem monster with a glowing blue aura",
-        "gromp": "Gromp - a giant green/brown toad creature",
-        "wolves": "Wolves - a pack of 3 wolves (1 big dark wolf + 2 smaller ones), camp is only dead when ALL wolves are gone",
-        "raptors": "Raptors - a group of 6 bird monsters (1 big red raptor + 5 small ones), camp is only dead when ALL raptors are gone",
-        "red_buff": "Red Brambleback - a large red golem monster with a glowing red aura",
-        "krugs": "Krugs - rock monsters that split when killed (1 big + 1 medium, then they split into smaller ones)",
-    }
-
-    desc = camp_desc.get(target_camp, target_camp)
-
-    return f"""You're coaching a Hecarim jungle clear in League of Legends.
-
-TARGET: {target_camp}
-WHAT IT LOOKS LIKE: {desc}
-
-Current stats: HP {last_hp_percent:.0f}% | fighting {time_at_camp:.1f}s | YOLO detections: {det_str}
-
-This is a screenshot of the game. Hecarim (a ghostly centaur champion) is clearing jungle camps. Look at the screenshot and tell me:
-- Can you see the {target_camp} monster(s)?
-- Is there a health bar visible?
-- Does the camp area look empty or are monsters still there?
-
-Think out loud briefly, then make the call.
-
-End with: VERDICT: DEAD or VERDICT: ALIVE"""
+    return f"""Look at screenshot. Is {target_camp} dead? Check if monsters still visible.
+Respond ONLY with JSON: {{"dead": true/false, "reason": "brief reason"}}"""
 
 
 # -----------------------------------------------------------------------------

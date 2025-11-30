@@ -313,7 +313,8 @@ class JungleBot:
         current_zone: str,
         target_camp: str,
         camp_detection: Optional[Detection],
-        camp_health: Optional[dict]
+        camp_health: Optional[dict],
+        mm_pos: Optional[tuple]
     ) -> State:
         """Determine current state based on game conditions (hardcoded logic)."""
         game_time = parse_game_time(game_time_str)
@@ -337,29 +338,42 @@ class JungleBot:
 
         # --- CAMPS HAVE SPAWNED ---
 
-        # Multi-monster camps (wolves, raptors) - MUST stay for minimum 15 seconds
+        # Multi-monster camps (wolves, raptors) - MUST stay for minimum time
         multi_monster_camps = {"wolves", "raptors"}
-        min_fight_time = 15.0  # seconds
+        min_fight_time = 17.0 if target_camp == "wolves" else 15.0  # wolves gets 2 extra sec
+        close_distance = 13  # minimap pixels - must be this close to count as "at camp"
 
         if target_camp in multi_monster_camps:
-            # Track when we started fighting this camp
-            if self.camp_engage_time is None and current_zone == target_camp:
-                self.camp_engage_time = time.time()
+            try:
+                # Check if we're actually close to the camp
+                dist_to_camp = self.distance_to_camp(mm_pos, target_camp) if mm_pos else 999
+                is_close_to_camp = dist_to_camp <= close_distance
 
-            # Force stay for minimum time
-            if self.camp_engage_time is not None:
-                time_fighting = time.time() - self.camp_engage_time
-                if time_fighting < min_fight_time:
-                    # Not enough time yet - keep attacking no matter what
-                    if camp_detection:
+                # Track when we got close to the camp
+                if self.camp_engage_time is None and is_close_to_camp:
+                    self.camp_engage_time = time.time()
+                    log_overlay(f"At {target_camp} (dist={dist_to_camp:.0f}) - 15s timer started")
+
+                # If timer started and we're close, force stay for minimum time
+                if self.camp_engage_time is not None and is_close_to_camp:
+                    time_at_camp = time.time() - self.camp_engage_time
+                    if time_at_camp < min_fight_time:
+                        # Not enough time yet - FORCE attacking no matter what
                         return State.ATTACKING
-                    else:
-                        return State.ENGAGING  # Keep trying to find and attack
 
-            # After 15 sec, only move on if Grok says dead
-            if self.grok_verified_clear:
-                log_overlay(f"{target_camp} - Grok verified after {min_fight_time}s - CLEARED")
-                return State.CAMP_CLEARED
+                    # After 15 sec, only move on if Grok says dead
+                    if self.grok_verified_clear:
+                        log_overlay(f"{target_camp} - Grok verified after {min_fight_time}s - CLEARED")
+                        return State.CAMP_CLEARED
+                    else:
+                        # Still waiting for Grok - keep attacking
+                        return State.ATTACKING
+                else:
+                    # Not close enough - need to walk there
+                    return State.WALKING_TO_CAMP
+            except Exception as e:
+                print(f"Error in multi-monster camp logic: {e}")
+                return State.ATTACKING  # Default to attacking on error
 
         else:
             # Regular camps - use detection + Grok/HP logic
@@ -388,8 +402,12 @@ class JungleBot:
                         log_overlay(f"{target_camp} not detected + 0 HP for 10 frames - CLEARED")
                         return State.CAMP_CLEARED
 
+        # Check distance to target camp
+        dist_to_camp = self.distance_to_camp(mm_pos, target_camp) if mm_pos else 999
+        is_close = dist_to_camp <= 15  # Must be within 15 minimap pixels
+
         # Is target camp visible on screen?
-        if camp_detection:
+        if camp_detection and is_close:
             self.no_detection_frames = 0  # Reset counter
             # Do we have it targeted (health bar showing)?
             if camp_health:
@@ -400,22 +418,18 @@ class JungleBot:
             else:
                 # Camp visible but not targeted - engage it
                 return State.ENGAGING
-        else:
-            # Camp not visible - count frames
+        elif is_close:
+            # Close but camp not visible - count frames
             self.no_detection_frames += 1
 
-            if current_zone == target_camp:
-                # We're at the zone but camp not detected - wait for Grok verification
-                if self.in_combat:
-                    # Stay attacking, Grok will verify if dead
-                    return State.ATTACKING
-                else:
-                    return State.ENGAGING  # Try to re-engage
+            # We're close but camp not detected - keep attacking or engaging
+            if self.in_combat:
+                return State.ATTACKING
             else:
-                # Need to walk there
-                return State.WALKING_TO_CAMP
-
-        return State.IDLE
+                return State.ENGAGING
+        else:
+            # Not close enough - need to walk there
+            return State.WALKING_TO_CAMP
 
     def execute_state(
         self,
@@ -448,16 +462,31 @@ class JungleBot:
             if self.target_camp == "gromp" and self.camp_index == 1:
                 self.level_up_ability("W")
 
-            # Click minimap to walk to target camp
-            if self.can_act():
-                region = get_region(f"mm_{self.target_camp.replace('_buff', '')}")
-                if region:
-                    self.click(region.x, region.y, right=True)
-                    log_overlay(f"Walking to {self.target_camp}")
+            # Click minimap to walk to target camp - spam it
+            region_id = f"mm_{self.target_camp.replace('_buff', '')}"
+            region = get_region(region_id)
+            if region:
+                # Spam right click on minimap
+                for _ in range(3):
+                    subprocess.run(["/opt/homebrew/bin/cliclick", f"rc:{region.x},{region.y}"], check=True)
+                    time.sleep(0.05)
+                log_overlay(f"Walking to {self.target_camp}")
+            else:
+                log_overlay(f"No region found: {region_id}")
 
         elif state == State.WAITING_FOR_SPAWN:
-            # Just wait, maybe position near camp
-            pass  # Do nothing, camps not spawned yet
+            # Auto attack at 1:29 and 1:35 to prep for camp spawn
+            game_secs = parse_game_time(self.ocr_timer(self.capture_screen()) or "0:00")
+            if game_secs in (89, 95):  # 1:29 and 1:35
+                # Find player and attack near them
+                player_pos = None
+                for d in detections:
+                    if d.cls == "player":
+                        player_pos = (d.x, d.y)
+                        break
+                if player_pos:
+                    subprocess.run(["/opt/homebrew/bin/cliclick", "t:a", f"c:{player_pos[0]},{player_pos[1]}"], check=True)
+                    log_overlay(f"Pre-attack at {game_secs}s")
 
         elif state == State.ENGAGING:
             # Camp visible - left click to show HP bar, then A + left click to attack
@@ -1126,7 +1155,8 @@ class JungleBot:
             current_zone=current_zone,
             target_camp=self.target_camp,
             camp_detection=target_camp_detection,
-            camp_health=camp_health
+            camp_health=camp_health,
+            mm_pos=mm_pos
         )
 
         # Log state changes
@@ -1253,7 +1283,16 @@ class JungleBot:
 
         try:
             while True:
-                self.update()
+                try:
+                    self.update()
+                except Exception as e:
+                    print(f"ERROR in update: {e}")
+                    import traceback
+                    traceback.print_exc()
+                    with open('gclear_crash.log', 'a') as f:
+                        f.write(f"\n--- Frame {self.frame_count} ---\n")
+                        f.write(traceback.format_exc())
+                    log_overlay(f"ERROR: {e}")
                 tick_strategist()  # Animate thinking indicator
                 process_events()  # Keep overlay responsive
                 time.sleep(tick_rate)
@@ -1281,8 +1320,29 @@ class JungleBot:
 
 
 def main():
-    bot = JungleBot()
-    bot.run()
+    import logging
+
+    # Set up file logging
+    logging.basicConfig(
+        level=logging.DEBUG,
+        format='%(asctime)s %(levelname)s: %(message)s',
+        handlers=[
+            logging.FileHandler('gclear_debug.log', mode='w'),
+            logging.StreamHandler()
+        ]
+    )
+    logger = logging.getLogger('gclear')
+
+    try:
+        logger.info("Starting GClear bot...")
+        bot = JungleBot()
+        bot.run()
+    except Exception as e:
+        logger.exception(f"CRASH: {e}")
+        import traceback
+        with open('gclear_crash.log', 'w') as f:
+            f.write(traceback.format_exc())
+        raise
 
 
 if __name__ == "__main__":
