@@ -160,9 +160,24 @@ trained on 83 hand-labeled frames from a hecarim clear, augmented to ~247 images
 
 trained yolov11 on roboflow with the following results:
 
-![training metrics](media/model_metrics.png)
-
-![training curves](media/model_performance.png)
+<table>
+<tr>
+<td colspan="2" align="center">
+<strong>metrics</strong><br/><br/>
+<img src="media/model_metrics.png" width="100%"/>
+</td>
+</tr>
+<tr>
+<td align="center">
+<strong>training data</strong><br/><br/>
+<img src="media/model_learning.png" height="300"/>
+</td>
+<td align="center">
+<strong>performance</strong><br/><br/>
+<img src="media/model_performance.png" height="300"/>
+</td>
+</tr>
+</table>
 
 ### grok as the brain
 
