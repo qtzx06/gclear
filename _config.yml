@@ -1,4 +1,4 @@
-theme: jekyll-theme-midnight
 title: gclear
 description: League jungle bot using YOLO + Grok
 baseurl: /gclear
+markdown: kramdown
