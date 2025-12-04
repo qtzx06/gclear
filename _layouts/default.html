@@ -1,0 +1,52 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{{ page.title | default: site.title }}</title>
+  <link rel="stylesheet" href="{{ '/assets/css/style.css?v=' | append: site.github.build_revision | relative_url }}">
+  <script src="https://cdn.jsdelivr.net/npm/mermaid/dist/mermaid.min.js"></script>
+</head>
+<body>
+  <header>
+    <div class="inner">
+      <a href="{{ '/' | relative_url }}">
+        <h1>{{ site.title }}</h1>
+      </a>
+      <h2>{{ site.description }}</h2>
+    </div>
+  </header>
+
+  <div id="content-wrapper">
+    <div class="inner clearfix">
+      <section id="main-content">
+        {{ content }}
+      </section>
+    </div>
+  </div>
+
+  <script>
+    // Convert ```mermaid code blocks to mermaid divs
+    document.querySelectorAll('pre code.language-mermaid').forEach(el => {
+      const pre = el.parentElement;
+      const div = document.createElement('div');
+      div.className = 'mermaid';
+      div.textContent = el.textContent;
+      pre.replaceWith(div);
+    });
+
+    mermaid.initialize({
+      startOnLoad: true,
+      theme: 'dark',
+      themeVariables: {
+        primaryColor: '#1e1e2e',
+        primaryTextColor: '#cdd6f4',
+        primaryBorderColor: '#45475a',
+        lineColor: '#6c7086',
+        secondaryColor: '#313244',
+        tertiaryColor: '#45475a'
+      }
+    });
+  </script>
+</body>
+</html>
