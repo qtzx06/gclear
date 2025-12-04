@@ -6,6 +6,9 @@ __pycache__/
 .venv/
 venv/
 .env
+*.egg-info/
+dist/
+build/
 
 # YOLO / ML
 runs/
@@ -13,14 +16,22 @@ datasets/
 *.pt
 *.onnx
 *.engine
+*.weights
 
 # Data (large files)
 data/raw/
 debug_frames/
 *.mov
 *.mp4
-*.png
-!data_collection/*.png
+
+# Media (ignore large video files, keep gifs and images)
+media/*.mov
+media/*.mp4
+!media/*.gif
+
+# Logs (keep folder, ignore contents)
+logs/*
+!logs/.gitkeep
 
 # Roboflow
 *.rf.*
@@ -30,10 +41,26 @@ debug_frames/
 ._*
 *.app/
 
+# Windows
+Thumbs.db
+ehthumbs.db
+
+# Linux
+*~
+
 # IDE
 .vscode/
 .idea/
+*.swp
+*.swo
 
 # Secrets
 *api_key*
 *.secret
+.env.local
+.env.*.local
+
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
