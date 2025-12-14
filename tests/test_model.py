@@ -6,7 +6,7 @@ from pathlib import Path
 
 MODEL_PATH = "models/hecarim.pt"  # or "runs/hecarim_v1/weights/best.pt" if training locally
 
-def test_inference():
+def check_inference():
     model = YOLO(MODEL_PATH)
 
     # Test on frames
@@ -28,4 +28,4 @@ def test_inference():
                 print(f"  {cls}: {conf:.2f} at ({int(x)}, {int(y)})")
 
 if __name__ == "__main__":
-    test_inference()
+    check_inference()

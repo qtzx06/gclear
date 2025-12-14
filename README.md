@@ -7,6 +7,7 @@ a league of legends jungle bot that uses yolo for object detection and grok for 
 <a href="https://youtu.be/nF_G7priALU">watch the full explainer</a>
 </p>
 
+<div align="center">
 <table>
 <tr>
 <td align="center">
@@ -19,6 +20,7 @@ a league of legends jungle bot that uses yolo for object detection and grok for 
 </td>
 </tr>
 </table>
+</div>
 
 ---
 

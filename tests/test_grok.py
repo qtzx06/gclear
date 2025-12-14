@@ -62,7 +62,7 @@ def call_grok_vision(image_path: str, prompt: str, model: str = "grok-4-1-fast-n
     return result["choices"][0]["message"]["content"]
 
 
-def test_health_reading(image_path: str) -> dict:
+def check_health_reading(image_path: str) -> dict:
     """Test health bar reading."""
     prompt = """Look at this game screenshot health bar.
     Return ONLY a JSON object with the health values:
@@ -76,7 +76,7 @@ def test_health_reading(image_path: str) -> dict:
     return response
 
 
-def test_strategy(image_path: str) -> str:
+def check_strategy(image_path: str) -> str:
     """Test strategic analysis with reasoning model."""
     prompt = """You are a League of Legends jungle clearing assistant for Hecarim.
 
@@ -113,10 +113,10 @@ if __name__ == "__main__":
                     print(f"Testing with: {test_frame}")
 
                     print("\n=== Testing Health Reading ===")
-                    test_health_reading(str(test_frame))
+                    check_health_reading(str(test_frame))
 
                     print("\n=== Testing Strategy ===")
-                    test_strategy(str(test_frame))
+                    check_strategy(str(test_frame))
                     break
         else:
             print("No frames found in runs/")
