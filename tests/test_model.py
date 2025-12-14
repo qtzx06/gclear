@@ -1,10 +1,17 @@
 #!/usr/bin/env python3
 """Test local YOLO model on frames."""
 
-from ultralytics import YOLO
 from pathlib import Path
 
+from ultralytics import YOLO
+
 MODEL_PATH = "models/hecarim.pt"  # or "runs/hecarim_v1/weights/best.pt" if training locally
+
+
+def test_imports():
+    """Verify core dependencies are available."""
+    assert YOLO is not None
+
 
 def check_inference():
     model = YOLO(MODEL_PATH)
