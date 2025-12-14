@@ -2,6 +2,11 @@
 
 a league of legends jungle bot that uses yolo for object detection and grok for decision-making.
 
+<p align="center">
+<img src="media/demo_clear.gif" width="700"/><br/>
+<a href="https://youtu.be/nF_G7priALU">watch the full explainer</a>
+</p>
+
 <table>
 <tr>
 <td align="center">
